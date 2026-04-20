@@ -149,3 +149,45 @@ func TestAnalyzeParallelAddRecords(t *testing.T) {
 		t.Fatalf("fingerprints = %d, want 2", len(report.Fingerprints))
 	}
 }
+
+func TestCompareReports(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	aRecords := []Record{
+		{Timestamp: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC), Query: `SELECT * FROM cpu`},
+		{Timestamp: time.Date(2026, 4, 20, 10, 0, 10, 0, time.UTC), Query: `SHOW TAG VALUES FROM cpu WITH KEY =~ /host.*/ LIMIT 10`},
+	}
+	bRecords := []Record{
+		{Timestamp: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC), Query: `SELECT * FROM cpu`},
+		{Timestamp: time.Date(2026, 4, 20, 10, 0, 5, 0, time.UTC), Query: `SELECT * FROM cpu`},
+		{Timestamp: time.Date(2026, 4, 20, 10, 0, 10, 0, time.UTC), Query: `SELECT mean(value) FROM cpu WHERE time >= '2026-04-20T10:00:00Z'`},
+	}
+
+	aReport, err := Analyze(aRecords, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("analyze A: %v", err)
+	}
+	bReport, err := Analyze(bRecords, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("analyze B: %v", err)
+	}
+
+	diff := CompareReports("A", *aReport, "B", *bReport)
+	if got, want := diff.StatementDelta, 1; got != want {
+		t.Fatalf("statement delta = %d, want %d", got, want)
+	}
+	if len(diff.NewFingerprints) != 1 {
+		t.Fatalf("new fingerprints = %d, want 1", len(diff.NewFingerprints))
+	}
+	if len(diff.RemovedFingerprints) != 1 {
+		t.Fatalf("removed fingerprints = %d, want 1", len(diff.RemovedFingerprints))
+	}
+	if len(diff.ChangedFingerprints) != 1 {
+		t.Fatalf("changed fingerprints = %d, want 1", len(diff.ChangedFingerprints))
+	}
+	if diff.ChangedFingerprints[0].CountDelta != 1 {
+		t.Fatalf("changed fingerprint count delta = %d, want 1", diff.ChangedFingerprints[0].CountDelta)
+	}
+	if diff.BatchA.QPS <= 0 || diff.BatchB.QPS <= 0 {
+		t.Fatalf("expected positive QPS, got A=%f B=%f", diff.BatchA.QPS, diff.BatchB.QPS)
+	}
+}

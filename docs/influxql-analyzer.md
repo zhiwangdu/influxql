@@ -6,6 +6,7 @@
 
 1. 把原始 InfluxQL 解析并归一化，生成稳定的 `fingerprint`，用于 SQL 归类。
 2. 基于执行时间窗口统计“特殊查询”，例如无时间条件、正则查询、通配符查询、大 `LIMIT`、高基数 `GROUP BY`、元数据查询、写入或破坏性查询。
+3. 对比两批查询 A 和 B，识别 B 相较于 A 的新增查询、消失查询、热点变化和 QPS 变化。
 
 工具由两部分组成：
 
@@ -84,10 +85,21 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
   -config ./config.json
 ```
 
+对比两批输入：
+
+```bash
+env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+  -input-a ./baseline.jsonl \
+  -input-b ./candidate.jsonl \
+  -workers 8
+```
+
 ### Supported Flags
 
 - `-input`: JSONL 输入文件，缺省时读取 `stdin`
 - `-config`: JSON 配置文件
+- `-input-a`: 对比模式中的基线批次 A
+- `-input-b`: 对比模式中的对照批次 B
 - `-window-start`: 时间窗口起点，`RFC3339`
 - `-window-end`: 时间窗口终点，`RFC3339`
 - `-output`: 当前仅支持 `json`
@@ -174,6 +186,39 @@ CLI 默认输出一个 JSON `Report`：
   - `error`: parser 错误信息
   - `count`: 出现次数
   - `sample_queries`: 失败样例
+
+### Compare Output Structure
+
+当同时提供 `-input-a` 和 `-input-b` 时，CLI 输出 `CompareReport`：
+
+```json
+{
+  "batch_a": {},
+  "batch_b": {},
+  "statement_delta": 0,
+  "qps_delta": 0,
+  "new_fingerprints": [],
+  "removed_fingerprints": [],
+  "changed_fingerprints": [],
+  "rule_deltas": []
+}
+```
+
+关键字段：
+
+- `batch_a` / `batch_b`: 两批输入各自的总量、QPS 和有效时间跨度
+- `statement_delta`: B 相对 A 的总 statement 数变化
+- `qps_delta`: B 相对 A 的整体 QPS 变化
+- `new_fingerprints`: B 新出现的查询模板
+- `removed_fingerprints`: A 有但 B 消失的查询模板
+- `changed_fingerprints`: 两边都存在但次数或 QPS 发生变化的查询模板
+- `rule_deltas`: 特殊规则命中数和 QPS 的变化
+
+QPS 计算规则：
+
+- 优先使用显式 `window-start` / `window-end`
+- 否则使用输入中观测到的 `timestamp` 最小值和最大值
+- 如果时间跨度不可用但有数据，退化为 1 秒窗口，避免除零
 
 
 ## Rule Config

@@ -48,6 +48,9 @@ The output is JSON and includes:
 - `special_rules`: aggregated rule hits such as `no_time_filter`, `has_regex`, `large_limit`
 - `parse_errors`: queries that failed parser validation
 
+The same CLI also supports comparing two batches with `-input-a` and `-input-b`
+to show new queries, removed queries, fingerprint count changes, and overall QPS deltas.
+
 Example normalized query:
 
 ```sql

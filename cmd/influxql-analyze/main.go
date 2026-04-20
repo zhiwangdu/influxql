@@ -17,6 +17,8 @@ import (
 func main() {
 	var (
 		inputPath   = flag.String("input", "", "JSONL input file path, defaults to stdin")
+		inputAPath  = flag.String("input-a", "", "baseline JSONL input file for compare mode")
+		inputBPath  = flag.String("input-b", "", "candidate JSONL input file for compare mode")
 		configPath  = flag.String("config", "", "JSON config file path")
 		windowStart = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
 		windowEnd   = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
@@ -53,6 +55,28 @@ func main() {
 		fatalf("parse window-end: %v", err)
 	}
 
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+
+	if *inputAPath != "" || *inputBPath != "" {
+		if *inputAPath == "" || *inputBPath == "" {
+			fatalf("compare mode requires both -input-a and -input-b")
+		}
+		aReport, err := runPath(*inputAPath, cfg, start, end)
+		if err != nil {
+			fatalf("analyze input-a: %v", err)
+		}
+		bReport, err := runPath(*inputBPath, cfg, start, end)
+		if err != nil {
+			fatalf("analyze input-b: %v", err)
+		}
+		diff := analyzer.CompareReports("A", aReport, "B", bReport)
+		if err := encoder.Encode(diff); err != nil {
+			fatalf("write output: %v", err)
+		}
+		return
+	}
+
 	reader, closeFn, err := openInput(*inputPath)
 	if err != nil {
 		fatalf("open input: %v", err)
@@ -65,12 +89,20 @@ func main() {
 	if err != nil {
 		fatalf("analyze input: %v", err)
 	}
-
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(report); err != nil {
 		fatalf("write output: %v", err)
 	}
+}
+
+func runPath(path string, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time) (analyzer.Report, error) {
+	reader, closeFn, err := openInput(path)
+	if err != nil {
+		return analyzer.Report{}, err
+	}
+	if closeFn != nil {
+		defer closeFn()
+	}
+	return run(reader, cfg, windowStart, windowEnd)
 }
 
 func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time) (analyzer.Report, error) {

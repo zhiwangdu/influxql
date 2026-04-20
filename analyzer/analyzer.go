@@ -99,6 +99,8 @@ type ParseErrorSummary struct {
 type Report struct {
 	WindowStart     *time.Time           `json:"window_start,omitempty"`
 	WindowEnd       *time.Time           `json:"window_end,omitempty"`
+	ObservedStart   *time.Time           `json:"observed_start,omitempty"`
+	ObservedEnd     *time.Time           `json:"observed_end,omitempty"`
 	TotalRecords    int                  `json:"total_records"`
 	RecordsInWindow int                  `json:"records_in_window"`
 	TotalStatements int                  `json:"total_statements"`
@@ -117,6 +119,55 @@ type Analyzer struct {
 	fingerprints map[string]*FingerprintSummary
 	rules        map[string]*RuleSummary
 	parseErrors  map[string]*ParseErrorSummary
+}
+
+type BatchStats struct {
+	Label             string     `json:"label"`
+	TotalRecords      int        `json:"total_records"`
+	RecordsInWindow   int        `json:"records_in_window"`
+	TotalStatements   int        `json:"total_statements"`
+	ParseErrorCount   int        `json:"parse_error_count"`
+	ObservedStart     *time.Time `json:"observed_start,omitempty"`
+	ObservedEnd       *time.Time `json:"observed_end,omitempty"`
+	WindowStart       *time.Time `json:"window_start,omitempty"`
+	WindowEnd         *time.Time `json:"window_end,omitempty"`
+	EffectiveDuration float64    `json:"effective_duration_seconds"`
+	QPS               float64    `json:"qps"`
+}
+
+type FingerprintDelta struct {
+	Fingerprint     string   `json:"fingerprint"`
+	StatementType   string   `json:"statement_type"`
+	NormalizedQuery string   `json:"normalized_query"`
+	Status          string   `json:"status"`
+	CountA          int      `json:"count_a"`
+	CountB          int      `json:"count_b"`
+	CountDelta      int      `json:"count_delta"`
+	QPSA            float64  `json:"qps_a"`
+	QPSB            float64  `json:"qps_b"`
+	QPSDelta        float64  `json:"qps_delta"`
+	Rules           []string `json:"rules,omitempty"`
+}
+
+type RuleDelta struct {
+	Rule       string  `json:"rule"`
+	CountA     int     `json:"count_a"`
+	CountB     int     `json:"count_b"`
+	CountDelta int     `json:"count_delta"`
+	QPSA       float64 `json:"qps_a"`
+	QPSB       float64 `json:"qps_b"`
+	QPSDelta   float64 `json:"qps_delta"`
+}
+
+type CompareReport struct {
+	BatchA              BatchStats         `json:"batch_a"`
+	BatchB              BatchStats         `json:"batch_b"`
+	StatementDelta      int                `json:"statement_delta"`
+	QPSDelta            float64            `json:"qps_delta"`
+	NewFingerprints     []FingerprintDelta `json:"new_fingerprints"`
+	RemovedFingerprints []FingerprintDelta `json:"removed_fingerprints"`
+	ChangedFingerprints []FingerprintDelta `json:"changed_fingerprints"`
+	RuleDeltas          []RuleDelta        `json:"rule_deltas,omitempty"`
 }
 
 func DefaultAnalyzerConfig() AnalyzerConfig {
@@ -154,6 +205,95 @@ func Analyze(records []Record, cfg AnalyzerConfig, windowStart, windowEnd *time.
 	return &report, nil
 }
 
+func CompareReports(aLabel string, a Report, bLabel string, b Report) CompareReport {
+	statsA := makeBatchStats(aLabel, a)
+	statsB := makeBatchStats(bLabel, b)
+
+	aByFP := make(map[string]FingerprintSummary, len(a.Fingerprints))
+	for _, fp := range a.Fingerprints {
+		aByFP[fp.Fingerprint] = fp
+	}
+	bByFP := make(map[string]FingerprintSummary, len(b.Fingerprints))
+	for _, fp := range b.Fingerprints {
+		bByFP[fp.Fingerprint] = fp
+	}
+
+	var added []FingerprintDelta
+	var removed []FingerprintDelta
+	var changed []FingerprintDelta
+
+	for fp, bItem := range bByFP {
+		if aItem, ok := aByFP[fp]; ok {
+			if aItem.Count != bItem.Count {
+				changed = append(changed, makeFingerprintDelta(aItem, bItem, statsA.EffectiveDuration, statsB.EffectiveDuration, "changed"))
+			}
+			continue
+		}
+		zero := FingerprintSummary{}
+		added = append(added, makeFingerprintDelta(zero, bItem, statsA.EffectiveDuration, statsB.EffectiveDuration, "added"))
+	}
+	for fp, aItem := range aByFP {
+		if _, ok := bByFP[fp]; ok {
+			continue
+		}
+		zero := FingerprintSummary{}
+		removed = append(removed, makeFingerprintDelta(aItem, zero, statsA.EffectiveDuration, statsB.EffectiveDuration, "removed"))
+	}
+
+	aRules := make(map[string]RuleSummary, len(a.SpecialRules))
+	for _, item := range a.SpecialRules {
+		aRules[item.Rule] = item
+	}
+	bRules := make(map[string]RuleSummary, len(b.SpecialRules))
+	for _, item := range b.SpecialRules {
+		bRules[item.Rule] = item
+	}
+
+	ruleSet := make(map[string]struct{}, len(aRules)+len(bRules))
+	for rule := range aRules {
+		ruleSet[rule] = struct{}{}
+	}
+	for rule := range bRules {
+		ruleSet[rule] = struct{}{}
+	}
+
+	ruleDeltas := make([]RuleDelta, 0, len(ruleSet))
+	for rule := range ruleSet {
+		aCount := aRules[rule].Count
+		bCount := bRules[rule].Count
+		if aCount == bCount {
+			continue
+		}
+		qpsA := qpsForCount(aCount, statsA.EffectiveDuration)
+		qpsB := qpsForCount(bCount, statsB.EffectiveDuration)
+		ruleDeltas = append(ruleDeltas, RuleDelta{
+			Rule:       rule,
+			CountA:     aCount,
+			CountB:     bCount,
+			CountDelta: bCount - aCount,
+			QPSA:       qpsA,
+			QPSB:       qpsB,
+			QPSDelta:   qpsB - qpsA,
+		})
+	}
+
+	sortFingerprintDeltas(added)
+	sortFingerprintDeltas(removed)
+	sortFingerprintDeltas(changed)
+	sortRuleDeltas(ruleDeltas)
+
+	return CompareReport{
+		BatchA:              statsA,
+		BatchB:              statsB,
+		StatementDelta:      b.TotalStatements - a.TotalStatements,
+		QPSDelta:            statsB.QPS - statsA.QPS,
+		NewFingerprints:     added,
+		RemovedFingerprints: removed,
+		ChangedFingerprints: changed,
+		RuleDeltas:          ruleDeltas,
+	}
+}
+
 func NormalizeQuery(query string) ([]NormalizeResult, error) {
 	parsed, err := influxql.ParseQuery(query)
 	if err != nil {
@@ -173,6 +313,7 @@ func (a *Analyzer) AddRecord(record Record) error {
 		return nil
 	}
 	a.report.RecordsInWindow++
+	a.trackObservedTime(record.Timestamp)
 
 	query := strings.TrimSpace(record.Query)
 	if query == "" {
@@ -270,6 +411,7 @@ func (a *Analyzer) Report() Report {
 }
 
 func (a *Analyzer) merge(other *Analyzer) {
+	a.mergeObservedTime(other.report.ObservedStart, other.report.ObservedEnd)
 	a.report.TotalRecords += other.report.TotalRecords
 	a.report.RecordsInWindow += other.report.RecordsInWindow
 	a.report.TotalStatements += other.report.TotalStatements
@@ -319,6 +461,29 @@ func (a *Analyzer) merge(other *Analyzer) {
 		for _, sample := range otherBucket.SampleQueries {
 			appendSample(&bucket.SampleQueries, sample, a.cfg.DetailLimit)
 		}
+	}
+}
+
+func (a *Analyzer) trackObservedTime(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	if a.report.ObservedStart == nil || ts.Before(*a.report.ObservedStart) {
+		start := ts
+		a.report.ObservedStart = &start
+	}
+	if a.report.ObservedEnd == nil || ts.After(*a.report.ObservedEnd) {
+		end := ts
+		a.report.ObservedEnd = &end
+	}
+}
+
+func (a *Analyzer) mergeObservedTime(start, end *time.Time) {
+	if start != nil {
+		a.trackObservedTime(*start)
+	}
+	if end != nil {
+		a.trackObservedTime(*end)
 	}
 }
 
@@ -468,4 +633,113 @@ func sortedParseErrors(src map[string]*ParseErrorSummary) []ParseErrorSummary {
 		return out[i].Error < out[j].Error
 	})
 	return out
+}
+
+func makeBatchStats(label string, report Report) BatchStats {
+	duration := effectiveDurationSeconds(report)
+	return BatchStats{
+		Label:             label,
+		TotalRecords:      report.TotalRecords,
+		RecordsInWindow:   report.RecordsInWindow,
+		TotalStatements:   report.TotalStatements,
+		ParseErrorCount:   report.ParseErrorCount,
+		ObservedStart:     report.ObservedStart,
+		ObservedEnd:       report.ObservedEnd,
+		WindowStart:       report.WindowStart,
+		WindowEnd:         report.WindowEnd,
+		EffectiveDuration: duration,
+		QPS:               qpsForCount(report.TotalStatements, duration),
+	}
+}
+
+func effectiveDurationSeconds(report Report) float64 {
+	if report.WindowStart != nil && report.WindowEnd != nil && report.WindowEnd.After(*report.WindowStart) {
+		return report.WindowEnd.Sub(*report.WindowStart).Seconds()
+	}
+	if report.ObservedStart != nil && report.ObservedEnd != nil {
+		dur := report.ObservedEnd.Sub(*report.ObservedStart).Seconds()
+		if dur > 0 {
+			return dur
+		}
+	}
+	if report.TotalStatements > 0 || report.RecordsInWindow > 0 {
+		return 1
+	}
+	return 0
+}
+
+func qpsForCount(count int, seconds float64) float64 {
+	if count == 0 || seconds <= 0 {
+		return 0
+	}
+	return float64(count) / seconds
+}
+
+func makeFingerprintDelta(aItem, bItem FingerprintSummary, durA, durB float64, status string) FingerprintDelta {
+	normalized := bItem.NormalizedQuery
+	statementType := bItem.StatementType
+	rules := bItem.Rules
+	fingerprint := bItem.Fingerprint
+	if fingerprint == "" {
+		fingerprint = aItem.Fingerprint
+	}
+	if normalized == "" {
+		normalized = aItem.NormalizedQuery
+	}
+	if statementType == "" {
+		statementType = aItem.StatementType
+	}
+	if len(rules) == 0 {
+		rules = aItem.Rules
+	}
+
+	qpsA := qpsForCount(aItem.Count, durA)
+	qpsB := qpsForCount(bItem.Count, durB)
+	return FingerprintDelta{
+		Fingerprint:     fingerprint,
+		StatementType:   statementType,
+		NormalizedQuery: normalized,
+		Status:          status,
+		CountA:          aItem.Count,
+		CountB:          bItem.Count,
+		CountDelta:      bItem.Count - aItem.Count,
+		QPSA:            qpsA,
+		QPSB:            qpsB,
+		QPSDelta:        qpsB - qpsA,
+		Rules:           append([]string(nil), rules...),
+	}
+}
+
+func sortFingerprintDeltas(items []FingerprintDelta) {
+	sort.Slice(items, func(i, j int) bool {
+		absI := items[i].CountDelta
+		if absI < 0 {
+			absI = -absI
+		}
+		absJ := items[j].CountDelta
+		if absJ < 0 {
+			absJ = -absJ
+		}
+		if absI != absJ {
+			return absI > absJ
+		}
+		return items[i].Fingerprint < items[j].Fingerprint
+	})
+}
+
+func sortRuleDeltas(items []RuleDelta) {
+	sort.Slice(items, func(i, j int) bool {
+		absI := items[i].CountDelta
+		if absI < 0 {
+			absI = -absI
+		}
+		absJ := items[j].CountDelta
+		if absJ < 0 {
+			absJ = -absJ
+		}
+		if absI != absJ {
+			return absI > absJ
+		}
+		return items[i].Rule < items[j].Rule
+	})
 }
