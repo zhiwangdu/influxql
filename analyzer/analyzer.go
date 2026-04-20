@@ -3,9 +3,11 @@ package analyzer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	influxql "github.com/influxdata/influxql"
@@ -69,6 +71,7 @@ type RuleConfig struct {
 
 type AnalyzerConfig struct {
 	DetailLimit int        `json:"detail_limit,omitempty"`
+	Workers     int        `json:"workers,omitempty"`
 	Rules       RuleConfig `json:"rules,omitempty"`
 }
 
@@ -144,10 +147,8 @@ func New(cfg AnalyzerConfig, windowStart, windowEnd *time.Time) *Analyzer {
 
 func Analyze(records []Record, cfg AnalyzerConfig, windowStart, windowEnd *time.Time) (*Report, error) {
 	a := New(cfg, windowStart, windowEnd)
-	for _, record := range records {
-		if err := a.AddRecord(record); err != nil {
-			return nil, err
-		}
+	if err := a.AddRecords(records); err != nil {
+		return nil, err
 	}
 	report := a.Report()
 	return &report, nil
@@ -196,12 +197,129 @@ func (a *Analyzer) AddRecord(record Record) error {
 	return nil
 }
 
+func (a *Analyzer) AddRecords(records []Record) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	workers := a.cfg.Workers
+	if workers <= 1 || len(records) == 1 {
+		for _, record := range records {
+			if err := a.AddRecord(record); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if workers > len(records) {
+		workers = len(records)
+	}
+
+	chunkSize := (len(records) + workers - 1) / workers
+	partials := make([]*Analyzer, workers)
+	errs := make([]error, workers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		start := i * chunkSize
+		if start >= len(records) {
+			break
+		}
+
+		end := start + chunkSize
+		if end > len(records) {
+			end = len(records)
+		}
+
+		wg.Add(1)
+		go func(idx, start, end int) {
+			defer wg.Done()
+			partial := New(a.cfg, a.windowStart, a.windowEnd)
+			for _, record := range records[start:end] {
+				if err := partial.AddRecord(record); err != nil {
+					errs[idx] = fmt.Errorf("worker %d: %w", idx, err)
+					return
+				}
+			}
+			partials[idx] = partial
+		}(i, start, end)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	for _, partial := range partials {
+		if partial == nil {
+			continue
+		}
+		a.merge(partial)
+	}
+	return nil
+}
+
 func (a *Analyzer) Report() Report {
 	report := a.report
 	report.Fingerprints = sortedFingerprints(a.fingerprints)
 	report.SpecialRules = sortedRules(a.rules)
 	report.ParseErrors = sortedParseErrors(a.parseErrors)
 	return report
+}
+
+func (a *Analyzer) merge(other *Analyzer) {
+	a.report.TotalRecords += other.report.TotalRecords
+	a.report.RecordsInWindow += other.report.RecordsInWindow
+	a.report.TotalStatements += other.report.TotalStatements
+	a.report.ParseErrorCount += other.report.ParseErrorCount
+
+	for fp, otherBucket := range other.fingerprints {
+		bucket := a.fingerprints[fp]
+		if bucket == nil {
+			copyBucket := *otherBucket
+			copyBucket.SampleQueries = append([]string(nil), otherBucket.SampleQueries...)
+			copyBucket.Rules = append([]string(nil), otherBucket.Rules...)
+			a.fingerprints[fp] = &copyBucket
+			continue
+		}
+		bucket.Count += otherBucket.Count
+		for _, sample := range otherBucket.SampleQueries {
+			appendSample(&bucket.SampleQueries, sample, a.cfg.DetailLimit)
+		}
+		for _, rule := range otherBucket.Rules {
+			appendUnique(&bucket.Rules, rule)
+		}
+	}
+
+	for rule, otherBucket := range other.rules {
+		bucket := a.rules[rule]
+		if bucket == nil {
+			copyBucket := *otherBucket
+			copyBucket.Fingerprints = append([]string(nil), otherBucket.Fingerprints...)
+			a.rules[rule] = &copyBucket
+			continue
+		}
+		bucket.Count += otherBucket.Count
+		for _, fp := range otherBucket.Fingerprints {
+			appendUnique(&bucket.Fingerprints, fp)
+		}
+	}
+
+	for message, otherBucket := range other.parseErrors {
+		bucket := a.parseErrors[message]
+		if bucket == nil {
+			copyBucket := *otherBucket
+			copyBucket.SampleQueries = append([]string(nil), otherBucket.SampleQueries...)
+			a.parseErrors[message] = &copyBucket
+			continue
+		}
+		bucket.Count += otherBucket.Count
+		for _, sample := range otherBucket.SampleQueries {
+			appendSample(&bucket.SampleQueries, sample, a.cfg.DetailLimit)
+		}
+	}
 }
 
 func normalizeStatement(stmt influxql.Statement) NormalizeResult {

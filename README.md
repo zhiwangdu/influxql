@@ -38,7 +38,8 @@ Or run it against a file:
 ```bash
 env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
   -input ./input.jsonl \
-  -detail-limit 2
+  -detail-limit 2 \
+  -workers 8
 ```
 
 The output is JSON and includes:

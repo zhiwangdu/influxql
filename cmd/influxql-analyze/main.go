@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ func main() {
 		windowEnd   = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
 		outputFmt   = flag.String("output", "json", "output format, only json is supported")
 		detailLimit = flag.Int("detail-limit", 3, "max sample queries per bucket")
+		workers     = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
 	)
 	flag.Parse()
 
@@ -30,6 +32,7 @@ func main() {
 
 	cfg := analyzer.DefaultAnalyzerConfig()
 	cfg.DetailLimit = *detailLimit
+	cfg.Workers = *workers
 	if *configPath != "" {
 		loaded, err := loadConfig(*configPath)
 		if err != nil {
@@ -74,6 +77,7 @@ func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.
 	a := analyzer.New(cfg, windowStart, windowEnd)
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	batch := make([]analyzer.Record, 0, 2048)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -84,12 +88,22 @@ func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.
 		if err != nil {
 			return analyzer.Report{}, err
 		}
-		if err := a.AddRecord(record); err != nil {
+		batch = append(batch, record)
+		if len(batch) < cap(batch) {
+			continue
+		}
+		if err := a.AddRecords(batch); err != nil {
 			return analyzer.Report{}, err
 		}
+		batch = batch[:0]
 	}
 	if err := scanner.Err(); err != nil {
 		return analyzer.Report{}, err
+	}
+	if len(batch) > 0 {
+		if err := a.AddRecords(batch); err != nil {
+			return analyzer.Report{}, err
+		}
 	}
 	return a.Report(), nil
 }

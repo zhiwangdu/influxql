@@ -105,3 +105,47 @@ func TestAnalyzeParseErrorsBucketed(t *testing.T) {
 		t.Fatalf("parse error buckets = %d, want 1", len(report.ParseErrors))
 	}
 }
+
+func TestAnalyzeParallelAddRecords(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.Workers = 4
+	cfg.Rules.LargeLimitThreshold = 100
+
+	analyzer := New(cfg, nil, nil)
+	records := []Record{
+		{
+			Timestamp: time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC),
+			Query:     `SELECT * FROM cpu`,
+		},
+		{
+			Timestamp: time.Date(2026, 4, 20, 10, 1, 0, 0, time.UTC),
+			Query:     `SELECT * FROM cpu`,
+		},
+		{
+			Timestamp: time.Date(2026, 4, 20, 10, 2, 0, 0, time.UTC),
+			Query:     `SHOW TAG VALUES FROM cpu WITH KEY =~ /host.*/ WHERE region =~ /cn/ LIMIT 1000`,
+		},
+		{
+			Timestamp: time.Date(2026, 4, 20, 10, 3, 0, 0, time.UTC),
+			Query:     `SELECT`,
+		},
+	}
+
+	if err := analyzer.AddRecords(records); err != nil {
+		t.Fatalf("add records: %v", err)
+	}
+
+	report := analyzer.Report()
+	if got, want := report.TotalRecords, 4; got != want {
+		t.Fatalf("total records = %d, want %d", got, want)
+	}
+	if got, want := report.TotalStatements, 3; got != want {
+		t.Fatalf("total statements = %d, want %d", got, want)
+	}
+	if got, want := report.ParseErrorCount, 1; got != want {
+		t.Fatalf("parse error count = %d, want %d", got, want)
+	}
+	if len(report.Fingerprints) != 2 {
+		t.Fatalf("fingerprints = %d, want 2", len(report.Fingerprints))
+	}
+}

@@ -92,6 +92,7 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `-window-end`: 时间窗口终点，`RFC3339`
 - `-output`: 当前仅支持 `json`
 - `-detail-limit`: 每个聚合桶保留的样例查询数
+- `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
 
 
 ## Mock Input And Output
@@ -289,6 +290,19 @@ CLI 默认输出一个 JSON `Report`：
 - 规则扩展目前是“参数化 + 开关”，不是完整 DSL
 - 执行时间只用于窗口过滤，不会用于把 `now()` 折算成具体时间
 - 归一化是模板化，不会主动抹平 measurement 或字段名差异
+
+### Concurrency
+
+当前版本已经支持并发分析：
+
+- CLI 通过 `-workers` 控制并发 worker 数
+- 读取输入仍按流式逐行进行
+- 分析阶段按批次并发执行，再合并到最终聚合结果
+
+适合的场景：
+
+- 大量独立查询日志的批量归类
+- parser 和归一化是主要 CPU 开销时
 
 
 ## Test Status
