@@ -16,15 +16,16 @@ import (
 
 func main() {
 	var (
-		inputPath   = flag.String("input", "", "JSONL input file path, defaults to stdin")
-		inputAPath  = flag.String("input-a", "", "baseline JSONL input file for compare mode")
-		inputBPath  = flag.String("input-b", "", "candidate JSONL input file for compare mode")
-		configPath  = flag.String("config", "", "JSON config file path")
-		windowStart = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
-		windowEnd   = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
-		outputFmt   = flag.String("output", "json", "output format, only json is supported")
-		detailLimit = flag.Int("detail-limit", 3, "max sample queries per bucket")
-		workers     = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
+		inputPath     = flag.String("input", "", "JSONL input file path, defaults to stdin")
+		inputAPath    = flag.String("input-a", "", "baseline JSONL input file for compare mode")
+		inputBPath    = flag.String("input-b", "", "candidate JSONL input file for compare mode")
+		configPath    = flag.String("config", "", "JSON config file path")
+		windowStart   = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
+		windowEnd     = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
+		outputFmt     = flag.String("output", "json", "output format, only json is supported")
+		detailLimit   = flag.Int("detail-limit", 3, "max sample queries per bucket")
+		workers       = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
+		progressEvery = flag.Int("progress-every", 10000, "print progress every N input records")
 	)
 	flag.Parse()
 
@@ -62,11 +63,11 @@ func main() {
 		if *inputAPath == "" || *inputBPath == "" {
 			fatalf("compare mode requires both -input-a and -input-b")
 		}
-		aReport, err := runPath(*inputAPath, cfg, start, end)
+		aReport, err := runPath("A", *inputAPath, cfg, start, end, *progressEvery)
 		if err != nil {
 			fatalf("analyze input-a: %v", err)
 		}
-		bReport, err := runPath(*inputBPath, cfg, start, end)
+		bReport, err := runPath("B", *inputBPath, cfg, start, end, *progressEvery)
 		if err != nil {
 			fatalf("analyze input-b: %v", err)
 		}
@@ -77,15 +78,18 @@ func main() {
 		return
 	}
 
-	reader, closeFn, err := openInput(*inputPath)
-	if err != nil {
-		fatalf("open input: %v", err)
-	}
-	if closeFn != nil {
-		defer closeFn()
+	if strings.TrimSpace(*inputPath) != "" {
+		report, err := runPath("input", *inputPath, cfg, start, end, *progressEvery)
+		if err != nil {
+			fatalf("analyze input: %v", err)
+		}
+		if err := encoder.Encode(report); err != nil {
+			fatalf("write output: %v", err)
+		}
+		return
 	}
 
-	report, err := run(reader, cfg, start, end)
+	report, err := run("input", os.Stdin, cfg, start, end, nil, *progressEvery)
 	if err != nil {
 		fatalf("analyze input: %v", err)
 	}
@@ -94,7 +98,11 @@ func main() {
 	}
 }
 
-func runPath(path string, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time) (analyzer.Report, error) {
+func runPath(label, path string, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time, progressEvery int) (analyzer.Report, error) {
+	total, err := countRecords(path)
+	if err != nil {
+		return analyzer.Report{}, err
+	}
 	reader, closeFn, err := openInput(path)
 	if err != nil {
 		return analyzer.Report{}, err
@@ -102,14 +110,16 @@ func runPath(path string, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *t
 	if closeFn != nil {
 		defer closeFn()
 	}
-	return run(reader, cfg, windowStart, windowEnd)
+	return run(label, reader, cfg, windowStart, windowEnd, &total, progressEvery)
 }
 
-func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time) (analyzer.Report, error) {
+func run(label string, r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.Time, total *int, progressEvery int) (analyzer.Report, error) {
 	a := analyzer.New(cfg, windowStart, windowEnd)
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	batch := make([]analyzer.Record, 0, 2048)
+	progress := newProgressPrinter(label, total, progressEvery)
+	progress.start()
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -127,6 +137,7 @@ func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.
 		if err := a.AddRecords(batch); err != nil {
 			return analyzer.Report{}, err
 		}
+		progress.advance(len(batch))
 		batch = batch[:0]
 	}
 	if err := scanner.Err(); err != nil {
@@ -136,8 +147,32 @@ func run(r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, windowEnd *time.
 		if err := a.AddRecords(batch); err != nil {
 			return analyzer.Report{}, err
 		}
+		progress.advance(len(batch))
 	}
+	progress.finish()
 	return a.Report(), nil
+}
+
+func countRecords(path string) (int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	total := 0
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		total++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func decodeRecord(line []byte) (analyzer.Record, error) {
@@ -212,6 +247,57 @@ func openInput(path string) (io.Reader, func() error, error) {
 		return nil, nil, err
 	}
 	return file, file.Close, nil
+}
+
+type progressPrinter struct {
+	label         string
+	total         *int
+	progressEvery int
+	processed     int
+	nextMark      int
+}
+
+func newProgressPrinter(label string, total *int, progressEvery int) *progressPrinter {
+	if progressEvery <= 0 {
+		progressEvery = 10000
+	}
+	return &progressPrinter{
+		label:         label,
+		total:         total,
+		progressEvery: progressEvery,
+		nextMark:      progressEvery,
+	}
+}
+
+func (p *progressPrinter) start() {
+	if p.total != nil {
+		fmt.Fprintf(os.Stderr, "[%s] total records: %d\n", p.label, *p.total)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[%s] total records: unknown (streaming input)\n", p.label)
+}
+
+func (p *progressPrinter) advance(n int) {
+	p.processed += n
+	if p.processed < p.nextMark {
+		return
+	}
+	p.print("progress")
+	for p.nextMark <= p.processed {
+		p.nextMark += p.progressEvery
+	}
+}
+
+func (p *progressPrinter) finish() {
+	p.print("done")
+}
+
+func (p *progressPrinter) print(stage string) {
+	if p.total != nil {
+		fmt.Fprintf(os.Stderr, "[%s] %s: analyzed %d/%d records\n", p.label, stage, p.processed, *p.total)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[%s] %s: analyzed %d records\n", p.label, stage, p.processed)
 }
 
 func fatalf(format string, args ...any) {

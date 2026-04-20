@@ -39,6 +39,7 @@ Or run it against a file:
 env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
   -input ./input.jsonl \
   -detail-limit 2 \
+  -progress-every 5000 \
   -workers 8
 ```
 

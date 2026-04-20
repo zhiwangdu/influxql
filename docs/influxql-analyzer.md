@@ -91,6 +91,7 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
   -input-a ./baseline.jsonl \
   -input-b ./candidate.jsonl \
+  -progress-every 5000 \
   -workers 8
 ```
 
@@ -105,6 +106,27 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `-output`: 当前仅支持 `json`
 - `-detail-limit`: 每个聚合桶保留的样例查询数
 - `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
+- `-progress-every`: 每处理多少条输入记录打印一次进度，默认 `10000`
+
+### Progress Output
+
+CLI 会把进度打印到 `stderr`，不会污染标准输出里的 JSON 结果。
+
+文件输入时会先统计总记录数，因此可以看到：
+
+```text
+[input] total records: 120000
+[input] progress: analyzed 50000/120000 records
+[input] progress: analyzed 100000/120000 records
+[input] done: analyzed 120000/120000 records
+```
+
+如果是 `stdin` 流式输入，无法提前知道总量，会退化成：
+
+```text
+[input] total records: unknown (streaming input)
+[input] progress: analyzed 50000 records
+```
 
 
 ## Mock Input And Output
