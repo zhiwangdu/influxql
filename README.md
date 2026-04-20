@@ -9,6 +9,52 @@ been lovingly crafted to feel familiar to those coming from other SQL or
 SQL-like environments while providing features specific to storing and analyzing
 time series data.
 
+## Related Tools
+
+This repository also includes an InfluxQL analysis CLI for query normalization,
+fingerprinting, and special-query detection.
+
+- Tool docs: [docs/influxql-analyzer.md](docs/influxql-analyzer.md)
+- CLI entrypoint: `cmd/influxql-analyze`
+- Core package: `analyzer/`
+
+### Quick Start
+
+Input format is `JSONL`, one record per line:
+
+```json
+{"timestamp":"2026-04-20T10:00:00Z","query":"SELECT * FROM cpu"}
+{"timestamp":"2026-04-20T10:01:00Z","query":"SHOW TAG VALUES FROM cpu WITH KEY =~ /host.*/ WHERE region =~ /cn/ LIMIT 1000"}
+```
+
+Run the analyzer from stdin:
+
+```bash
+cat input.jsonl | env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze
+```
+
+Or run it against a file:
+
+```bash
+env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+  -input ./input.jsonl \
+  -detail-limit 2
+```
+
+The output is JSON and includes:
+
+- `fingerprints`: normalized queries grouped by stable fingerprint
+- `special_rules`: aggregated rule hits such as `no_time_filter`, `has_regex`, `large_limit`
+- `parse_errors`: queries that failed parser validation
+
+Example normalized query:
+
+```sql
+SHOW TAG VALUES FROM cpu WITH KEY =~ /.*/ WHERE region =~ /.*/ LIMIT 1
+```
+
+For full usage, config format, rule definitions, internal structure, and test notes,
+see [docs/influxql-analyzer.md](docs/influxql-analyzer.md).
 
 ## Notation
 
