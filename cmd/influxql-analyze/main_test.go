@@ -41,6 +41,30 @@ func TestDecodeRecordExtractsEmbeddedJSONLog(t *testing.T) {
 	}
 }
 
+func TestDecodeRecordDoesNotRetainRawLog(t *testing.T) {
+	line := []byte(`{"timestamp":"2026-06-06T08:10:12Z","query":"SELECT * FROM cpu","hostname":"127.0.0.1:8086"}`)
+
+	record, err := decodeRecord(line)
+	if err != nil {
+		t.Fatalf("decodeRecord returned error: %v", err)
+	}
+	if record.Raw != nil {
+		t.Fatalf("raw = %#v, want nil on optimized CLI path", record.Raw)
+	}
+}
+
+func TestDecodeRecordSupportsUnixTimestamp(t *testing.T) {
+	line := []byte(`{"timestamp":1780733412,"query":"SELECT * FROM cpu"}`)
+
+	record, err := decodeRecord(line)
+	if err != nil {
+		t.Fatalf("decodeRecord returned error: %v", err)
+	}
+	if got, want := record.Timestamp, time.Unix(1780733412, 0).UTC(); !got.Equal(want) {
+		t.Fatalf("timestamp = %s, want %s", got, want)
+	}
+}
+
 func TestDecodeRecordReportsMissingJSON(t *testing.T) {
 	_, err := decodeRecord([]byte(`not a json log line`))
 	if err == nil || !strings.Contains(err.Error(), "not JSON") {

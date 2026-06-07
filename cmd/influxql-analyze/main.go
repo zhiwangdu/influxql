@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,16 +19,17 @@ import (
 
 func main() {
 	var (
-		inputPath     = flag.String("input", "", "JSONL input file path, defaults to stdin")
-		inputAPath    = flag.String("input-a", "", "baseline JSONL input file for compare mode")
-		inputBPath    = flag.String("input-b", "", "candidate JSONL input file for compare mode")
-		configPath    = flag.String("config", "", "JSON config file path")
-		windowStart   = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
-		windowEnd     = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
-		outputFmt     = flag.String("output", "json", "output format, only json is supported")
-		detailLimit   = flag.Int("detail-limit", 3, "max sample queries per bucket")
-		workers       = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
-		progressEvery = flag.Int("progress-every", 10000, "print progress every N input records")
+		inputPath      = flag.String("input", "", "JSONL input file path, defaults to stdin")
+		inputAPath     = flag.String("input-a", "", "baseline JSONL input file for compare mode")
+		inputBPath     = flag.String("input-b", "", "candidate JSONL input file for compare mode")
+		configPath     = flag.String("config", "", "JSON config file path")
+		windowStart    = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
+		windowEnd      = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
+		outputFmt      = flag.String("output", "json", "output format, only json is supported")
+		detailLimit    = flag.Int("detail-limit", 3, "max sample queries per bucket")
+		workers        = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
+		progressEvery  = flag.Int("progress-every", 10000, "print progress every N input records")
+		queryCacheSize = flag.Int("query-cache-size", -1, "max normalized query cache entries, 0 disables cache")
 	)
 	flag.Parse()
 
@@ -36,6 +40,9 @@ func main() {
 	cfg := analyzer.DefaultAnalyzerConfig()
 	cfg.DetailLimit = *detailLimit
 	cfg.Workers = *workers
+	if *queryCacheSize >= 0 {
+		cfg.QueryCacheSize = *queryCacheSize
+	}
 	if *configPath != "" {
 		loaded, err := loadConfig(*configPath)
 		if err != nil {
@@ -44,6 +51,9 @@ func main() {
 		cfg = loaded
 		if *detailLimit > 0 {
 			cfg.DetailLimit = *detailLimit
+		}
+		if *queryCacheSize >= 0 {
+			cfg.QueryCacheSize = *queryCacheSize
 		}
 	}
 
@@ -121,12 +131,12 @@ func run(label string, r io.Reader, cfg analyzer.AnalyzerConfig, windowStart, wi
 	progress := newProgressPrinter(label, total, progressEvery)
 	progress.start()
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
 			continue
 		}
 
-		record, err := decodeRecord([]byte(line))
+		record, err := decodeRecord(line)
 		if err != nil {
 			return analyzer.Report{}, err
 		}
@@ -164,7 +174,7 @@ func countRecords(path string) (int, error) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	total := 0
 	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) == "" {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
 			continue
 		}
 		total++
@@ -175,26 +185,35 @@ func countRecords(path string) (int, error) {
 	return total, nil
 }
 
+type inputRecord struct {
+	Timestamp json.RawMessage `json:"timestamp"`
+	Time      string          `json:"time"`
+	Query     *string         `json:"query"`
+}
+
 func decodeRecord(line []byte) (analyzer.Record, error) {
-	raw, err := decodeRawRecord(line)
+	data, err := jsonRecordBytes(line)
 	if err != nil {
 		return analyzer.Record{}, err
 	}
 
-	record := analyzer.Record{Raw: raw}
-	query, ok := raw["query"]
-	if !ok {
+	var input inputRecord
+	if err := json.Unmarshal(data, &input); err != nil {
+		return analyzer.Record{}, err
+	}
+	if input.Query == nil {
 		return analyzer.Record{}, fmt.Errorf("input record missing query")
 	}
 
-	queryString, ok := query.(string)
-	if !ok {
-		return analyzer.Record{}, fmt.Errorf("input query must be a string")
-	}
-	record.Query = queryString
-
-	if ts, ok := recordTimeValue(raw); ok {
-		parsed, err := parseFlexibleTime(ts)
+	record := analyzer.Record{Query: *input.Query}
+	if len(input.Timestamp) > 0 {
+		parsed, err := parseRawTime(input.Timestamp)
+		if err != nil {
+			return analyzer.Record{}, fmt.Errorf("parse timestamp: %w", err)
+		}
+		record.Timestamp = parsed
+	} else if strings.TrimSpace(input.Time) != "" {
+		parsed, err := parseTimeString(input.Time)
 		if err != nil {
 			return analyzer.Record{}, fmt.Errorf("parse timestamp: %w", err)
 		}
@@ -203,44 +222,47 @@ func decodeRecord(line []byte) (analyzer.Record, error) {
 	return record, nil
 }
 
-func decodeRawRecord(line []byte) (map[string]any, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(line, &raw); err == nil {
-		return raw, nil
+func jsonRecordBytes(line []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("input record is empty")
+	}
+	if trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' {
+		return trimmed, nil
 	}
 
-	text := strings.TrimSpace(string(line))
+	text := string(trimmed)
 	start := strings.IndexByte(text, '{')
 	end := strings.LastIndexByte(text, '}')
 	if start < 0 || end <= start {
 		return nil, fmt.Errorf("input record is not JSON")
 	}
-	if err := json.Unmarshal([]byte(text[start:end+1]), &raw); err != nil {
-		return nil, err
-	}
-	return raw, nil
+	return []byte(text[start : end+1]), nil
 }
 
-func recordTimeValue(raw map[string]any) (any, bool) {
-	if ts, ok := raw["timestamp"]; ok {
-		return ts, true
+func parseRawTime(raw json.RawMessage) (time.Time, error) {
+	value := strings.TrimSpace(string(raw))
+	if value == "" || value == "null" {
+		return time.Time{}, fmt.Errorf("timestamp is empty")
 	}
-	if ts, ok := raw["time"]; ok {
-		return ts, true
+	if value[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return time.Time{}, err
+		}
+		return parseTimeString(text)
 	}
-	return nil, false
+
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("unsupported timestamp value %q", value)
+	}
+	sec, frac := math.Modf(seconds)
+	return time.Unix(int64(sec), int64(frac*1e9)).UTC(), nil
 }
 
-func parseFlexibleTime(value any) (time.Time, error) {
-	switch v := value.(type) {
-	case string:
-		return time.Parse(time.RFC3339Nano, v)
-	case float64:
-		sec := int64(v)
-		return time.Unix(sec, 0).UTC(), nil
-	default:
-		return time.Time{}, fmt.Errorf("unsupported timestamp type %T", value)
-	}
+func parseTimeString(value string) (time.Time, error) {
+	return time.Parse(time.RFC3339Nano, value)
 }
 
 func parseOptionalTime(value string) (*time.Time, error) {

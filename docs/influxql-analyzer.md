@@ -114,6 +114,7 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `-detail-limit`: 每个聚合桶保留的样例查询数
 - `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
 - `-progress-every`: 每处理多少条输入记录打印一次进度，默认 `10000`
+- `-query-cache-size`: 归一化查询缓存容量，默认 `10000`，设置为 `0` 可关闭
 
 ### Benchmark
 
@@ -125,12 +126,18 @@ env GOCACHE=/tmp/influxql-gocache go test ./analyzer ./cmd/influxql-analyze -run
 
 当前 benchmark 覆盖两段：`analyzer` 包对已解码记录的批量分析吞吐，以及 CLI 对 executor JSON 日志行的解码吞吐。输出中的 `records/s` 是每秒处理记录数。
 
-当前环境短测结果（Intel i5-10600KF，`-benchtime=100ms`）：
+当前 CLI 解码路径只提取 `query`、`time` 和 `timestamp`，不会保留整条日志到 `Raw`，以减少大文件分析时的分配和 GC 压力。Analyzer 默认启用有界归一化缓存（`query_cache_size = 10000`），重复原始查询可跳过 parser 和 AST 归一化。
 
-- 单 worker 分析：约 `76k records/s`
-- 4 worker 分析：约 `249k records/s`
-- executor 日志解码：约 `226k records/s`
+当前环境测试结果（Intel i5-10600KF，`-benchtime=1s`）：
+
+- 单 worker 分析，无缓存：约 `67k records/s`
+- 单 worker 分析，默认缓存：约 `4.7M records/s`
+- 4 worker 分析，无缓存：约 `247k records/s`
+- 4 worker 分析，默认缓存：约 `5.6M records/s`
+- executor 日志解码：约 `451k records/s`
 - 验证命令：`env GOCACHE=/tmp/influxql-gocache go test ./...` 通过。
+
+缓存收益取决于原始查询重复度；如果每条查询都不同，吞吐会更接近 no-cache 结果。
 
 ### Progress Output
 
@@ -276,6 +283,7 @@ QPS 计算规则：
 ```json
 {
   "detail_limit": 5,
+  "query_cache_size": 10000,
   "rules": {
     "large_limit_threshold": 500,
     "group_by_tag_threshold": 3,
@@ -306,6 +314,7 @@ QPS 计算规则：
 
 - `large_limit_threshold = 1000`
 - `group_by_tag_threshold = 2`
+- `query_cache_size = 10000`
 
 
 ## Internal Structure

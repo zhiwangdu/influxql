@@ -24,6 +24,7 @@ const (
 	defaultLargeLimitThreshold  = 1000
 	defaultGroupByTagThreshold  = 2
 	defaultDetailLimit          = 3
+	defaultQueryCacheSize       = 10000
 	normalizedStringPlaceholder = "str"
 	normalizedIdentPlaceholder  = "tag"
 )
@@ -70,9 +71,10 @@ type RuleConfig struct {
 }
 
 type AnalyzerConfig struct {
-	DetailLimit int        `json:"detail_limit,omitempty"`
-	Workers     int        `json:"workers,omitempty"`
-	Rules       RuleConfig `json:"rules,omitempty"`
+	DetailLimit    int        `json:"detail_limit,omitempty"`
+	Workers        int        `json:"workers,omitempty"`
+	QueryCacheSize int        `json:"query_cache_size,omitempty"`
+	Rules          RuleConfig `json:"rules,omitempty"`
 }
 
 type FingerprintSummary struct {
@@ -119,6 +121,10 @@ type Analyzer struct {
 	fingerprints map[string]*FingerprintSummary
 	rules        map[string]*RuleSummary
 	parseErrors  map[string]*ParseErrorSummary
+
+	queryCache     map[string][]NormalizeResult
+	queryCacheKeys []string
+	queryCacheNext int
 }
 
 type BatchStats struct {
@@ -172,7 +178,8 @@ type CompareReport struct {
 
 func DefaultAnalyzerConfig() AnalyzerConfig {
 	return AnalyzerConfig{
-		DetailLimit: defaultDetailLimit,
+		DetailLimit:    defaultDetailLimit,
+		QueryCacheSize: defaultQueryCacheSize,
 		Rules: RuleConfig{
 			LargeLimitThreshold: defaultLargeLimitThreshold,
 			GroupByTagThreshold: defaultGroupByTagThreshold,
@@ -182,7 +189,7 @@ func DefaultAnalyzerConfig() AnalyzerConfig {
 
 func New(cfg AnalyzerConfig, windowStart, windowEnd *time.Time) *Analyzer {
 	cfg = applyDefaults(cfg)
-	return &Analyzer{
+	a := &Analyzer{
 		cfg:         cfg,
 		windowStart: windowStart,
 		windowEnd:   windowEnd,
@@ -194,6 +201,11 @@ func New(cfg AnalyzerConfig, windowStart, windowEnd *time.Time) *Analyzer {
 		rules:        make(map[string]*RuleSummary),
 		parseErrors:  make(map[string]*ParseErrorSummary),
 	}
+	if cfg.QueryCacheSize > 0 {
+		a.queryCache = make(map[string][]NormalizeResult, cfg.QueryCacheSize)
+		a.queryCacheKeys = make([]string, 0, cfg.QueryCacheSize)
+	}
+	return a
 }
 
 func Analyze(records []Record, cfg AnalyzerConfig, windowStart, windowEnd *time.Time) (*Report, error) {
@@ -307,6 +319,45 @@ func NormalizeQuery(query string) ([]NormalizeResult, error) {
 	return results, nil
 }
 
+func (a *Analyzer) normalizeQuery(query string) ([]NormalizeResult, error) {
+	if a.queryCache == nil {
+		return NormalizeQuery(query)
+	}
+	if results, ok := a.queryCache[query]; ok {
+		return results, nil
+	}
+
+	results, err := NormalizeQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	a.addQueryCacheEntry(query, results)
+	return results, nil
+}
+
+func (a *Analyzer) addQueryCacheEntry(query string, results []NormalizeResult) {
+	if a.cfg.QueryCacheSize <= 0 {
+		return
+	}
+	if _, ok := a.queryCache[query]; ok {
+		return
+	}
+	if len(a.queryCacheKeys) < a.cfg.QueryCacheSize {
+		a.queryCacheKeys = append(a.queryCacheKeys, query)
+		a.queryCache[query] = results
+		return
+	}
+
+	evict := a.queryCacheKeys[a.queryCacheNext]
+	delete(a.queryCache, evict)
+	a.queryCacheKeys[a.queryCacheNext] = query
+	a.queryCache[query] = results
+	a.queryCacheNext++
+	if a.queryCacheNext >= len(a.queryCacheKeys) {
+		a.queryCacheNext = 0
+	}
+}
+
 func (a *Analyzer) AddRecord(record Record) error {
 	a.report.TotalRecords++
 	if !a.withinWindow(record.Timestamp) {
@@ -320,7 +371,7 @@ func (a *Analyzer) AddRecord(record Record) error {
 		return nil
 	}
 
-	results, err := NormalizeQuery(query)
+	results, err := a.normalizeQuery(query)
 	if err != nil {
 		a.report.ParseErrorCount++
 		a.addParseError(err.Error(), query)
@@ -514,6 +565,9 @@ func applyDefaults(cfg AnalyzerConfig) AnalyzerConfig {
 	}
 	if cfg.Rules.GroupByTagThreshold <= 0 {
 		cfg.Rules.GroupByTagThreshold = defaults.Rules.GroupByTagThreshold
+	}
+	if cfg.QueryCacheSize < 0 {
+		cfg.QueryCacheSize = 0
 	}
 	return cfg
 }

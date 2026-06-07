@@ -7,24 +7,30 @@ import (
 
 const benchmarkRecordCount = 8192
 
+func BenchmarkAddRecordsThroughputNoCache(b *testing.B) {
+	records := makeBenchmarkRecords(benchmarkRecordCount)
+	cfg := DefaultAnalyzerConfig()
+	cfg.Workers = 1
+	cfg.QueryCacheSize = 0
+
+	benchmarkAddRecords(b, records, cfg)
+}
+
 func BenchmarkAddRecordsThroughput(b *testing.B) {
 	records := makeBenchmarkRecords(benchmarkRecordCount)
 	cfg := DefaultAnalyzerConfig()
 	cfg.Workers = 1
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	started := time.Now()
-	total := 0
-	for i := 0; i < b.N; i++ {
-		a := New(cfg, nil, nil)
-		if err := a.AddRecords(records); err != nil {
-			b.Fatalf("add records: %v", err)
-		}
-		total += len(records)
-	}
-	elapsed := time.Since(started)
-	b.ReportMetric(float64(total)/elapsed.Seconds(), "records/s")
+	benchmarkAddRecords(b, records, cfg)
+}
+
+func BenchmarkAddRecordsThroughputParallelWorkersNoCache(b *testing.B) {
+	records := makeBenchmarkRecords(benchmarkRecordCount)
+	cfg := DefaultAnalyzerConfig()
+	cfg.Workers = 4
+	cfg.QueryCacheSize = 0
+
+	benchmarkAddRecords(b, records, cfg)
 }
 
 func BenchmarkAddRecordsThroughputParallelWorkers(b *testing.B) {
@@ -32,6 +38,10 @@ func BenchmarkAddRecordsThroughputParallelWorkers(b *testing.B) {
 	cfg := DefaultAnalyzerConfig()
 	cfg.Workers = 4
 
+	benchmarkAddRecords(b, records, cfg)
+}
+
+func benchmarkAddRecords(b *testing.B, records []Record, cfg AnalyzerConfig) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	started := time.Now()

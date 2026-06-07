@@ -88,6 +88,34 @@ func TestAnalyzeAggregatesFingerprintsAndRules(t *testing.T) {
 	}
 }
 
+func TestAnalyzerQueryCacheCanBeDisabled(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.QueryCacheSize = 0
+	analyzer := New(cfg, nil, nil)
+	if analyzer.queryCache != nil {
+		t.Fatal("query cache initialized when query_cache_size is 0")
+	}
+}
+
+func TestAnalyzerQueryCacheIsBounded(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.QueryCacheSize = 2
+	analyzer := New(cfg, nil, nil)
+	records := []Record{
+		{Timestamp: time.Now().UTC(), Query: `SELECT * FROM cpu`},
+		{Timestamp: time.Now().UTC(), Query: `SELECT * FROM mem`},
+		{Timestamp: time.Now().UTC(), Query: `SELECT * FROM disk`},
+	}
+	for _, record := range records {
+		if err := analyzer.AddRecord(record); err != nil {
+			t.Fatalf("add record: %v", err)
+		}
+	}
+	if got, want := len(analyzer.queryCache), 2; got != want {
+		t.Fatalf("query cache size = %d, want %d", got, want)
+	}
+}
+
 func TestAnalyzeParseErrorsBucketed(t *testing.T) {
 	analyzer := New(DefaultAnalyzerConfig(), nil, nil)
 	if err := analyzer.AddRecord(Record{
