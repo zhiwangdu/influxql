@@ -176,8 +176,8 @@ func countRecords(path string) (int, error) {
 }
 
 func decodeRecord(line []byte) (analyzer.Record, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(line, &raw); err != nil {
+	raw, err := decodeRawRecord(line)
+	if err != nil {
 		return analyzer.Record{}, err
 	}
 
@@ -193,7 +193,7 @@ func decodeRecord(line []byte) (analyzer.Record, error) {
 	}
 	record.Query = queryString
 
-	if ts, ok := raw["timestamp"]; ok {
+	if ts, ok := recordTimeValue(raw); ok {
 		parsed, err := parseFlexibleTime(ts)
 		if err != nil {
 			return analyzer.Record{}, fmt.Errorf("parse timestamp: %w", err)
@@ -203,10 +203,38 @@ func decodeRecord(line []byte) (analyzer.Record, error) {
 	return record, nil
 }
 
+func decodeRawRecord(line []byte) (map[string]any, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(line, &raw); err == nil {
+		return raw, nil
+	}
+
+	text := strings.TrimSpace(string(line))
+	start := strings.IndexByte(text, '{')
+	end := strings.LastIndexByte(text, '}')
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("input record is not JSON")
+	}
+	if err := json.Unmarshal([]byte(text[start:end+1]), &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func recordTimeValue(raw map[string]any) (any, bool) {
+	if ts, ok := raw["timestamp"]; ok {
+		return ts, true
+	}
+	if ts, ok := raw["time"]; ok {
+		return ts, true
+	}
+	return nil, false
+}
+
 func parseFlexibleTime(value any) (time.Time, error) {
 	switch v := value.(type) {
 	case string:
-		return time.Parse(time.RFC3339, v)
+		return time.Parse(time.RFC3339Nano, v)
 	case float64:
 		sec := int64(v)
 		return time.Unix(sec, 0).UTC(), nil

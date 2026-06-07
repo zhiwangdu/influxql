@@ -40,8 +40,15 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 
 字段说明：
 
-- `timestamp`: 执行时间，默认按 `RFC3339` 解析，也支持 Unix 秒时间戳数字
+- `timestamp`: 执行时间，默认按 `RFC3339`/`RFC3339Nano` 解析，也支持 Unix 秒时间戳数字
+- `time`: 日志时间字段；当没有 `timestamp` 时会自动作为执行时间解析
 - `query`: 原始 InfluxQL 语句
+
+也可以直接输入包含 JSON 对象的文本日志行，例如：
+
+```json
+{"level":"info","time":"2026-06-06T16:10:12.675546+08:00","msg":"Executing query","hostname":"127.0.0.1:8086","service":"executor","query":"SELECT * FROM mydb.autogen.cpu","batch":1,"location":"query/executor.go:535","repeated":1}
+```
 
 额外字段会被读取进 `Raw`，但当前版本不会参与统计。
 
@@ -107,6 +114,23 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `-detail-limit`: 每个聚合桶保留的样例查询数
 - `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
 - `-progress-every`: 每处理多少条输入记录打印一次进度，默认 `10000`
+
+### Benchmark
+
+运行吞吐量 benchmark：
+
+```bash
+env GOCACHE=/tmp/influxql-gocache go test ./analyzer ./cmd/influxql-analyze -run=BenchmarkNeverMatches -bench=Throughput -benchmem
+```
+
+当前 benchmark 覆盖两段：`analyzer` 包对已解码记录的批量分析吞吐，以及 CLI 对 executor JSON 日志行的解码吞吐。输出中的 `records/s` 是每秒处理记录数。
+
+当前环境短测结果（Intel i5-10600KF，`-benchtime=100ms`）：
+
+- 单 worker 分析：约 `76k records/s`
+- 4 worker 分析：约 `249k records/s`
+- executor 日志解码：约 `226k records/s`
+- 验证命令：`env GOCACHE=/tmp/influxql-gocache go test ./...` 通过。
 
 ### Progress Output
 
