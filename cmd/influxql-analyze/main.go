@@ -19,17 +19,18 @@ import (
 
 func main() {
 	var (
-		inputPath      = flag.String("input", "", "JSONL input file path, defaults to stdin")
-		inputAPath     = flag.String("input-a", "", "baseline JSONL input file for compare mode")
-		inputBPath     = flag.String("input-b", "", "candidate JSONL input file for compare mode")
-		configPath     = flag.String("config", "", "JSON config file path")
-		windowStart    = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
-		windowEnd      = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
-		outputFmt      = flag.String("output", "json", "output format, only json is supported")
-		detailLimit    = flag.Int("detail-limit", 3, "max sample queries per bucket")
-		workers        = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
-		progressEvery  = flag.Int("progress-every", 10000, "print progress every N input records")
-		queryCacheSize = flag.Int("query-cache-size", -1, "max normalized query cache entries, 0 disables cache")
+		inputPath         = flag.String("input", "", "JSONL input file path, defaults to stdin")
+		inputAPath        = flag.String("input-a", "", "baseline JSONL input file for compare mode")
+		inputBPath        = flag.String("input-b", "", "candidate JSONL input file for compare mode")
+		configPath        = flag.String("config", "", "JSON config file path")
+		windowStart       = flag.String("window-start", "", "RFC3339 lower bound for record timestamp")
+		windowEnd         = flag.String("window-end", "", "RFC3339 upper bound for record timestamp")
+		outputFmt         = flag.String("output", "json", "output format, only json is supported")
+		detailLimit       = flag.Int("detail-limit", 3, "max sample queries per bucket")
+		workers           = flag.Int("workers", runtime.GOMAXPROCS(0), "number of concurrent analyzer workers")
+		progressEvery     = flag.Int("progress-every", 10000, "print progress every N input records")
+		queryCacheSize    = flag.Int("query-cache-size", -1, "max normalized query cache entries, 0 disables cache")
+		realtimeThreshold = flag.String("realtime-threshold", "", "max age for realtime query lower bound, for example 2h or 30m")
 	)
 	flag.Parse()
 
@@ -55,6 +56,13 @@ func main() {
 		if *queryCacheSize >= 0 {
 			cfg.QueryCacheSize = *queryCacheSize
 		}
+	}
+	if strings.TrimSpace(*realtimeThreshold) != "" {
+		dur, err := time.ParseDuration(*realtimeThreshold)
+		if err != nil {
+			fatalf("parse realtime-threshold: %v", err)
+		}
+		cfg.RealtimeQuery.ThresholdSeconds = int64(dur.Seconds())
 	}
 
 	start, err := parseOptionalTime(*windowStart)

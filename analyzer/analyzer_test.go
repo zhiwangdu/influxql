@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -217,5 +218,73 @@ func TestCompareReports(t *testing.T) {
 	}
 	if diff.BatchA.QPS <= 0 || diff.BatchB.QPS <= 0 {
 		t.Fatalf("expected positive QPS, got A=%f B=%f", diff.BatchA.QPS, diff.BatchB.QPS)
+	}
+}
+
+func TestAnalyzeRealtimeQuerySummary(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.RealtimeQuery.ThresholdSeconds = int64((2 * time.Hour).Seconds())
+	base := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	ms := base.Add(-30*time.Minute).UnixNano() / int64(time.Millisecond)
+	records := []Record{
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= '2026-06-08 00:00:00'`},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= '2026-06-08T11:00:00Z'`},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= now() - 30m`},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= ` + strconv.FormatInt(ms, 10)},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= '2026-06-01T00:00:00Z'`},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time < '2026-06-08T12:00:00Z'`},
+		{Timestamp: base, Query: `SELECT * FROM cpu`},
+	}
+
+	report, err := Analyze(records, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if got, want := report.RealtimeQuery.Total, 7; got != want {
+		t.Fatalf("realtime total = %d, want %d", got, want)
+	}
+	if got, want := report.RealtimeQuery.Realtime, 4; got != want {
+		t.Fatalf("realtime count = %d, want %d", got, want)
+	}
+	if got, want := report.RealtimeQuery.NonRealtime, 2; got != want {
+		t.Fatalf("non realtime count = %d, want %d", got, want)
+	}
+	if got, want := report.RealtimeQuery.Unknown, 1; got != want {
+		t.Fatalf("unknown count = %d, want %d", got, want)
+	}
+	if report.RealtimeQuery.AllRealtime {
+		t.Fatal("all_realtime = true, want false")
+	}
+
+	rules := make(map[string]int)
+	for _, rule := range report.SpecialRules {
+		rules[rule.Rule] = rule.Count
+	}
+	if got, want := rules[RuleNotRealtimeQuery], 2; got != want {
+		t.Fatalf("not realtime rule count = %d, want %d", got, want)
+	}
+}
+
+func TestAnalyzeRealtimeQuerySummaryParallelMerge(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.Workers = 2
+	base := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	records := []Record{
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= now() - 5m`},
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= '2026-06-01T00:00:00Z'`},
+	}
+
+	report, err := Analyze(records, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if got, want := report.RealtimeQuery.Total, 2; got != want {
+		t.Fatalf("realtime total = %d, want %d", got, want)
+	}
+	if got, want := report.RealtimeQuery.Realtime, 1; got != want {
+		t.Fatalf("realtime count = %d, want %d", got, want)
+	}
+	if got, want := report.RealtimeQuery.NonRealtime, 1; got != want {
+		t.Fatalf("non realtime count = %d, want %d", got, want)
 	}
 }

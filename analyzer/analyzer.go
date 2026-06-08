@@ -21,10 +21,12 @@ const (
 	RuleGroupByHighCardinality  = "group_by_high_cardinality_risk"
 	RuleMetaQuery               = "meta_query"
 	RuleWriteOrDestructive      = "write_or_destructive"
+	RuleNotRealtimeQuery        = "not_realtime_query"
 	defaultLargeLimitThreshold  = 1000
 	defaultGroupByTagThreshold  = 2
 	defaultDetailLimit          = 3
 	defaultQueryCacheSize       = 10000
+	defaultRealtimeThreshold    = 24 * time.Hour
 	normalizedStringPlaceholder = "str"
 	normalizedIdentPlaceholder  = "tag"
 )
@@ -70,11 +72,16 @@ type RuleConfig struct {
 	GroupByTagThreshold int             `json:"group_by_tag_threshold,omitempty"`
 }
 
+type RealtimeQueryConfig struct {
+	ThresholdSeconds int64 `json:"threshold_seconds,omitempty"`
+}
+
 type AnalyzerConfig struct {
-	DetailLimit    int        `json:"detail_limit,omitempty"`
-	Workers        int        `json:"workers,omitempty"`
-	QueryCacheSize int        `json:"query_cache_size,omitempty"`
-	Rules          RuleConfig `json:"rules,omitempty"`
+	DetailLimit    int                 `json:"detail_limit,omitempty"`
+	Workers        int                 `json:"workers,omitempty"`
+	QueryCacheSize int                 `json:"query_cache_size,omitempty"`
+	Rules          RuleConfig          `json:"rules,omitempty"`
+	RealtimeQuery  RealtimeQueryConfig `json:"realtime_query,omitempty"`
 }
 
 type FingerprintSummary struct {
@@ -98,6 +105,30 @@ type ParseErrorSummary struct {
 	SampleQueries []string `json:"sample_queries,omitempty"`
 }
 
+type RealtimeTimeRangeSummary struct {
+	Min           *time.Time `json:"min,omitempty"`
+	Max           *time.Time `json:"max,omitempty"`
+	WindowSeconds *float64   `json:"window_seconds,omitempty"`
+}
+
+type RealtimeQuerySample struct {
+	Query     string                    `json:"query"`
+	Reason    string                    `json:"reason"`
+	LogTime   *time.Time                `json:"log_time,omitempty"`
+	TimeRange *RealtimeTimeRangeSummary `json:"time_range,omitempty"`
+}
+
+type RealtimeQuerySummary struct {
+	ThresholdSeconds  int64                 `json:"threshold_seconds"`
+	Total             int                   `json:"total"`
+	Realtime          int                   `json:"realtime"`
+	NonRealtime       int                   `json:"non_realtime"`
+	Unknown           int                   `json:"unknown"`
+	AllRealtime       bool                  `json:"all_realtime"`
+	SampleNonRealtime []RealtimeQuerySample `json:"sample_non_realtime,omitempty"`
+	SampleUnknown     []RealtimeQuerySample `json:"sample_unknown,omitempty"`
+}
+
 type Report struct {
 	WindowStart     *time.Time           `json:"window_start,omitempty"`
 	WindowEnd       *time.Time           `json:"window_end,omitempty"`
@@ -110,6 +141,7 @@ type Report struct {
 	Fingerprints    []FingerprintSummary `json:"fingerprints"`
 	SpecialRules    []RuleSummary        `json:"special_rules"`
 	ParseErrors     []ParseErrorSummary  `json:"parse_errors,omitempty"`
+	RealtimeQuery   RealtimeQuerySummary `json:"realtime_query"`
 }
 
 type Analyzer struct {
@@ -122,7 +154,7 @@ type Analyzer struct {
 	rules        map[string]*RuleSummary
 	parseErrors  map[string]*ParseErrorSummary
 
-	queryCache     map[string][]NormalizeResult
+	queryCache     map[string]queryAnalysis
 	queryCacheKeys []string
 	queryCacheNext int
 }
@@ -184,6 +216,9 @@ func DefaultAnalyzerConfig() AnalyzerConfig {
 			LargeLimitThreshold: defaultLargeLimitThreshold,
 			GroupByTagThreshold: defaultGroupByTagThreshold,
 		},
+		RealtimeQuery: RealtimeQueryConfig{
+			ThresholdSeconds: int64(defaultRealtimeThreshold.Seconds()),
+		},
 	}
 }
 
@@ -196,13 +231,16 @@ func New(cfg AnalyzerConfig, windowStart, windowEnd *time.Time) *Analyzer {
 		report: Report{
 			WindowStart: windowStart,
 			WindowEnd:   windowEnd,
+			RealtimeQuery: RealtimeQuerySummary{
+				ThresholdSeconds: cfg.RealtimeQuery.ThresholdSeconds,
+			},
 		},
 		fingerprints: make(map[string]*FingerprintSummary),
 		rules:        make(map[string]*RuleSummary),
 		parseErrors:  make(map[string]*ParseErrorSummary),
 	}
 	if cfg.QueryCacheSize > 0 {
-		a.queryCache = make(map[string][]NormalizeResult, cfg.QueryCacheSize)
+		a.queryCache = make(map[string]queryAnalysis, cfg.QueryCacheSize)
 		a.queryCacheKeys = make([]string, 0, cfg.QueryCacheSize)
 	}
 	return a
@@ -307,35 +345,47 @@ func CompareReports(aLabel string, a Report, bLabel string, b Report) CompareRep
 }
 
 func NormalizeQuery(query string) ([]NormalizeResult, error) {
+	analysis, err := analyzeQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	return analysis.Results, nil
+}
+
+func analyzeQuery(query string) (queryAnalysis, error) {
 	parsed, err := influxql.ParseQuery(query)
 	if err != nil {
-		return nil, err
+		return queryAnalysis{}, err
 	}
 
-	results := make([]NormalizeResult, 0, len(parsed.Statements))
+	analysis := queryAnalysis{
+		Results:        make([]NormalizeResult, 0, len(parsed.Statements)),
+		RealtimeChecks: make([]realtimeCheck, 0, len(parsed.Statements)),
+	}
 	for _, stmt := range parsed.Statements {
-		results = append(results, normalizeStatement(stmt))
+		analysis.RealtimeChecks = append(analysis.RealtimeChecks, extractRealtimeCheck(stmt))
+		analysis.Results = append(analysis.Results, normalizeStatement(stmt))
 	}
-	return results, nil
+	return analysis, nil
 }
 
-func (a *Analyzer) normalizeQuery(query string) ([]NormalizeResult, error) {
+func (a *Analyzer) analyzeQuery(query string) (queryAnalysis, error) {
 	if a.queryCache == nil {
-		return NormalizeQuery(query)
+		return analyzeQuery(query)
 	}
-	if results, ok := a.queryCache[query]; ok {
-		return results, nil
+	if analysis, ok := a.queryCache[query]; ok {
+		return analysis, nil
 	}
 
-	results, err := NormalizeQuery(query)
+	analysis, err := analyzeQuery(query)
 	if err != nil {
-		return nil, err
+		return queryAnalysis{}, err
 	}
-	a.addQueryCacheEntry(query, results)
-	return results, nil
+	a.addQueryCacheEntry(query, analysis)
+	return analysis, nil
 }
 
-func (a *Analyzer) addQueryCacheEntry(query string, results []NormalizeResult) {
+func (a *Analyzer) addQueryCacheEntry(query string, analysis queryAnalysis) {
 	if a.cfg.QueryCacheSize <= 0 {
 		return
 	}
@@ -344,14 +394,14 @@ func (a *Analyzer) addQueryCacheEntry(query string, results []NormalizeResult) {
 	}
 	if len(a.queryCacheKeys) < a.cfg.QueryCacheSize {
 		a.queryCacheKeys = append(a.queryCacheKeys, query)
-		a.queryCache[query] = results
+		a.queryCache[query] = analysis
 		return
 	}
 
 	evict := a.queryCacheKeys[a.queryCacheNext]
 	delete(a.queryCache, evict)
 	a.queryCacheKeys[a.queryCacheNext] = query
-	a.queryCache[query] = results
+	a.queryCache[query] = analysis
 	a.queryCacheNext++
 	if a.queryCacheNext >= len(a.queryCacheKeys) {
 		a.queryCacheNext = 0
@@ -371,19 +421,24 @@ func (a *Analyzer) AddRecord(record Record) error {
 		return nil
 	}
 
-	results, err := a.normalizeQuery(query)
+	analysis, err := a.analyzeQuery(query)
 	if err != nil {
 		a.report.ParseErrorCount++
 		a.addParseError(err.Error(), query)
 		return nil
 	}
 
-	for _, result := range results {
+	for idx, result := range analysis.Results {
 		a.report.TotalStatements++
 		a.addFingerprint(result, query)
+		realtime := a.evaluateRealtime(realtimeCheckAt(analysis.RealtimeChecks, idx), record.Timestamp, query)
 		for _, match := range matchRules(result.Features, a.cfg.Rules) {
 			a.addRuleMatch(match.Name, result.Fingerprint)
 			a.addRuleToFingerprint(result.Fingerprint, match.Name)
+		}
+		if realtime.Status == realtimeStatusNonRealtime && ruleEnabled(a.cfg.Rules, RuleNotRealtimeQuery) {
+			a.addRuleMatch(RuleNotRealtimeQuery, result.Fingerprint)
+			a.addRuleToFingerprint(result.Fingerprint, RuleNotRealtimeQuery)
 		}
 	}
 	return nil
@@ -458,6 +513,7 @@ func (a *Analyzer) Report() Report {
 	report.Fingerprints = sortedFingerprints(a.fingerprints)
 	report.SpecialRules = sortedRules(a.rules)
 	report.ParseErrors = sortedParseErrors(a.parseErrors)
+	report.RealtimeQuery.AllRealtime = report.RealtimeQuery.Total > 0 && report.RealtimeQuery.NonRealtime == 0 && report.RealtimeQuery.Unknown == 0
 	return report
 }
 
@@ -467,6 +523,7 @@ func (a *Analyzer) merge(other *Analyzer) {
 	a.report.RecordsInWindow += other.report.RecordsInWindow
 	a.report.TotalStatements += other.report.TotalStatements
 	a.report.ParseErrorCount += other.report.ParseErrorCount
+	a.mergeRealtimeQuery(other.report.RealtimeQuery)
 
 	for fp, otherBucket := range other.fingerprints {
 		bucket := a.fingerprints[fp]
@@ -568,6 +625,9 @@ func applyDefaults(cfg AnalyzerConfig) AnalyzerConfig {
 	}
 	if cfg.QueryCacheSize < 0 {
 		cfg.QueryCacheSize = 0
+	}
+	if cfg.RealtimeQuery.ThresholdSeconds <= 0 {
+		cfg.RealtimeQuery.ThresholdSeconds = defaults.RealtimeQuery.ThresholdSeconds
 	}
 	return cfg
 }

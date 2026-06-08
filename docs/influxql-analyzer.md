@@ -5,7 +5,7 @@
 `influxql-analyze` 是一个基于当前仓库 InfluxQL parser 的离线分析工具，用来做两件事：
 
 1. 把原始 InfluxQL 解析并归一化，生成稳定的 `fingerprint`，用于 SQL 归类。
-2. 基于执行时间窗口统计“特殊查询”，例如无时间条件、正则查询、通配符查询、大 `LIMIT`、高基数 `GROUP BY`、元数据查询、写入或破坏性查询。
+2. 基于执行时间窗口统计“特殊查询”，例如无时间条件、正则查询、通配符查询、大 `LIMIT`、高基数 `GROUP BY`、元数据查询、写入或破坏性查询，以及非实时查询。
 3. 对比两批查询 A 和 B，识别 B 相较于 A 的新增查询、消失查询、热点变化和 QPS 变化。
 
 工具由两部分组成：
@@ -43,6 +43,8 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `timestamp`: 执行时间，默认按 `RFC3339`/`RFC3339Nano` 解析，也支持 Unix 秒时间戳数字
 - `time`: 日志时间字段；当没有 `timestamp` 时会自动作为执行时间解析
 - `query`: 原始 InfluxQL 语句
+
+实时查询分析会把记录执行时间（优先 `timestamp`，否则 `time`）和 SQL 里的 `WHERE time` 条件比较。默认阈值是 `24h`：如果 `WHERE time` 下界和日志时间在同一天，或下界距离日志时间不超过阈值，则计为实时查询。`WHERE time` 支持 RFC3339、`yyyy-mm-dd hh:MM:ss`、`now() - duration`，数字时间戳会按常见秒/毫秒/微秒/纳秒尺度推断。
 
 也可以直接输入包含 JSON 对象的文本日志行，例如：
 
@@ -115,6 +117,7 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 - `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
 - `-progress-every`: 每处理多少条输入记录打印一次进度，默认 `10000`
 - `-query-cache-size`: 归一化查询缓存容量，默认 `10000`，设置为 `0` 可关闭
+- `-realtime-threshold`: 实时查询下界距离日志时间的最大阈值，例如 `2h` 或 `30m`，默认 `24h`
 
 ### Benchmark
 
@@ -218,7 +221,8 @@ CLI 默认输出一个 JSON `Report`：
   "parse_error_count": 0,
   "fingerprints": [],
   "special_rules": [],
-  "parse_errors": []
+  "parse_errors": [],
+  "realtime_query": {}
 }
 ```
 
@@ -235,6 +239,14 @@ CLI 默认输出一个 JSON `Report`：
   - `rule`: 规则名
   - `count`: 命中次数
   - `fingerprints`: 命中的 fingerprint 列表
+- `realtime_query`: 实时查询汇总
+  - `threshold_seconds`: 判定阈值，默认 `86400`
+  - `total`: 参与实时性分析的 select-like 语句数
+  - `realtime`: 判定为实时查询的数量
+  - `non_realtime`: 明确判定为非实时查询的数量
+  - `unknown`: 缺少日志时间、没有可提取 `WHERE time` 下界，或遇到不支持表达式时的数量
+  - `all_realtime`: `total > 0` 且没有 `non_realtime` 或 `unknown` 时为 `true`
+  - `sample_non_realtime`/`sample_unknown`: 样例查询、原因、日志时间和提取到的时间范围
 - `parse_errors`: 解析失败桶
   - `error`: parser 错误信息
   - `count`: 出现次数
