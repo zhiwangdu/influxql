@@ -1,38 +1,53 @@
 # InfluxQL Analyzer
 
-## Overview
+## 概览
 
-`influxql-analyze` 是一个基于当前仓库 InfluxQL parser 的离线分析工具，用来做两件事：
+`influxql-analyze` 是一个基于当前仓库 InfluxQL parser 的离线查询日志分析工具。当前功能包括：
 
-1. 把原始 InfluxQL 解析并归一化，生成稳定的 `fingerprint`，用于 SQL 归类。
-2. 基于执行时间窗口统计“特殊查询”，例如无时间条件、正则查询、通配符查询、大 `LIMIT`、高基数 `GROUP BY`、元数据查询、写入或破坏性查询，以及非实时查询。
-3. 对比两批查询 A 和 B，识别 B 相较于 A 的新增查询、消失查询、热点变化和 QPS 变化。
+1. 解析原始 InfluxQL，并归一化成稳定的 `fingerprint`。
+2. 按 fingerprint 聚合查询量和样例。
+3. 识别特殊查询：无时间条件、正则、通配符、大 `LIMIT`、高基数 `GROUP BY`、元数据查询、写入或破坏性查询、非实时查询。
+4. 根据 SQL 中的 `WHERE time` 和日志时间，判断 select-like 查询是实时、非实时还是未知。
+5. 对比两批查询，输出 fingerprint、规则、次数和 QPS 的变化。
 
-工具由两部分组成：
+代码分为两部分：
 
 - 库包：`analyzer/`
-- CLI：`cmd/influxql-analyze`
+- CLI：`cmd/influxql-analyze/`
 
+更紧凑的行为规格见仓库根目录 `SPEC.md`。
 
-## Usage
+## 构建和运行
 
-### Build
-
-如果本机 `go` 路径存在多个版本，建议显式使用一致的 Go 二进制：
-
-```bash
-/Users/duzhiwang/devkits/go125/go/bin/go build ./cmd/influxql-analyze
-```
-
-也可以直接运行：
+构建 CLI：
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze
+go build ./cmd/influxql-analyze
 ```
 
-### Input Format
+从标准输入读取：
 
-输入格式是 `JSONL`，每行一条记录，至少包含：
+```bash
+cat input.jsonl | go run ./cmd/influxql-analyze
+```
+
+从文件读取：
+
+```bash
+go run ./cmd/influxql-analyze -input ./input.jsonl
+```
+
+在受限环境中建议显式使用可写 Go cache：
+
+```bash
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze -input ./input.jsonl
+```
+
+## 输入格式
+
+输入是 JSONL，每行一条记录。非空行必须包含一个 JSON 对象；这个 JSON 对象可以是整行，也可以嵌在更大的文本日志行里。
+
+最小可用记录：
 
 ```json
 {"timestamp":"2026-04-20T10:00:00Z","query":"SELECT * FROM cpu"}
@@ -40,181 +55,166 @@ env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run .
 
 字段说明：
 
-- `timestamp`: 执行时间，默认按 `RFC3339`/`RFC3339Nano` 解析，也支持 Unix 秒时间戳数字
-- `time`: 日志时间字段；当没有 `timestamp` 时会自动作为执行时间解析
-- `query`: 原始 InfluxQL 语句
+- `query`: 必填，原始 InfluxQL 查询字符串。
+- `timestamp`: 可选，执行时间；存在时优先于 `time`。
+  - 字符串按 RFC3339/RFC3339Nano 解析。
+  - 数字按 Unix 秒解析。
+- `time`: 可选日志时间字符串；仅在缺少 `timestamp` 时使用，按 RFC3339/RFC3339Nano 解析。
 
-实时查询分析会把记录执行时间（优先 `timestamp`，否则 `time`）和 SQL 里的 `WHERE time` 条件比较。默认阈值是 `24h`：如果 `WHERE time` 下界和日志时间在同一天，或下界距离日志时间不超过阈值，则计为实时查询。`WHERE time` 支持 RFC3339、`yyyy-mm-dd hh:MM:ss`、`now() - duration`，数字时间戳会按常见秒/毫秒/微秒/纳秒尺度推断。
-
-也可以直接输入包含 JSON 对象的文本日志行，例如：
+executor 日志行示例：
 
 ```json
 {"level":"info","time":"2026-06-06T16:10:12.675546+08:00","msg":"Executing query","hostname":"127.0.0.1:8086","service":"executor","query":"SELECT * FROM mydb.autogen.cpu","batch":1,"location":"query/executor.go:535","repeated":1}
 ```
 
-额外字段会被读取进 `Raw`，但当前版本不会参与统计。
+当前 CLI 解码路径只提取 `query`、`timestamp` 和 `time`，不会把完整日志对象保存在 `Record.Raw` 中。
 
-### Basic Command
+## CLI 参数
 
-从标准输入读取：
+- `-input`: JSONL 输入文件，缺省时读取 stdin。
+- `-input-a`: 对比模式中的基线 JSONL 输入文件。
+- `-input-b`: 对比模式中的候选 JSONL 输入文件。
+- `-config`: JSON 配置文件，对应 `analyzer.AnalyzerConfig`。
+- `-window-start`: 记录时间窗口起点，RFC3339。
+- `-window-end`: 记录时间窗口终点，RFC3339。
+- `-output`: 输出格式，当前仅支持 `json`。
+- `-detail-limit`: 每个聚合桶最多保留的样例查询数，默认 `3`。
+- `-workers`: analyzer worker 数，默认 `runtime.GOMAXPROCS(0)`。
+- `-progress-every`: 每处理 N 条输入记录向 stderr 打印一次进度，默认 `10000`。
+- `-query-cache-size`: 查询缓存最大条目数，默认 `10000`；设置为 `0` 可关闭缓存。
+- `-realtime-threshold`: 实时查询下界距离日志时间的最大阈值，使用 Go duration 语法，例如 `2h` 或 `30m`，默认 `24h`。
+
+对比模式必须同时提供 `-input-a` 和 `-input-b`。
+
+## 常用命令
+
+分析一个文件：
 
 ```bash
-cat input.jsonl | env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze
-```
-
-从文件读取：
-
-```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze \
   -input ./input.jsonl
 ```
 
-带时间窗口过滤：
+使用记录时间窗口过滤：
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze \
   -input ./input.jsonl \
   -window-start 2026-04-20T10:00:00Z \
   -window-end 2026-04-20T11:00:00Z
 ```
 
-限制每个 bucket 返回的样例数量：
+调整样例数量和实时查询阈值：
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze \
   -input ./input.jsonl \
-  -detail-limit 2
-```
-
-使用规则配置文件：
-
-```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
-  -input ./input.jsonl \
-  -config ./config.json
+  -detail-limit 5 \
+  -realtime-threshold 2h
 ```
 
 对比两批输入：
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze \
   -input-a ./baseline.jsonl \
   -input-b ./candidate.jsonl \
   -progress-every 5000 \
   -workers 8
 ```
 
-### Supported Flags
+## 配置文件
 
-- `-input`: JSONL 输入文件，缺省时读取 `stdin`
-- `-config`: JSON 配置文件
-- `-input-a`: 对比模式中的基线批次 A
-- `-input-b`: 对比模式中的对照批次 B
-- `-window-start`: 时间窗口起点，`RFC3339`
-- `-window-end`: 时间窗口终点，`RFC3339`
-- `-output`: 当前仅支持 `json`
-- `-detail-limit`: 每个聚合桶保留的样例查询数
-- `-workers`: 并发分析 worker 数，默认等于当前 `GOMAXPROCS`
-- `-progress-every`: 每处理多少条输入记录打印一次进度，默认 `10000`
-- `-query-cache-size`: 归一化查询缓存容量，默认 `10000`，设置为 `0` 可关闭
-- `-realtime-threshold`: 实时查询下界距离日志时间的最大阈值，例如 `2h` 或 `30m`，默认 `24h`
+配置文件是 JSON，对应 `analyzer.AnalyzerConfig`。
 
-### Benchmark
-
-运行吞吐量 benchmark：
-
-```bash
-env GOCACHE=/tmp/influxql-gocache go test ./analyzer ./cmd/influxql-analyze -run=BenchmarkNeverMatches -bench=Throughput -benchmem
-```
-
-当前 benchmark 覆盖两段：`analyzer` 包对已解码记录的批量分析吞吐，以及 CLI 对 executor JSON 日志行的解码吞吐。输出中的 `records/s` 是每秒处理记录数。
-
-当前 CLI 解码路径只提取 `query`、`time` 和 `timestamp`，不会保留整条日志到 `Raw`，以减少大文件分析时的分配和 GC 压力。Analyzer 默认启用有界归一化缓存（`query_cache_size = 10000`），重复原始查询可跳过 parser 和 AST 归一化。
-
-当前环境测试结果（Intel i5-10600KF，`-benchtime=1s`）：
-
-- 单 worker 分析，无缓存：约 `67k records/s`
-- 单 worker 分析，默认缓存：约 `4.7M records/s`
-- 4 worker 分析，无缓存：约 `247k records/s`
-- 4 worker 分析，默认缓存：约 `5.6M records/s`
-- executor 日志解码：约 `451k records/s`
-- 验证命令：`env GOCACHE=/tmp/influxql-gocache go test ./...` 通过。
-
-缓存收益取决于原始查询重复度；如果每条查询都不同，吞吐会更接近 no-cache 结果。
-
-### Progress Output
-
-CLI 会把进度打印到 `stderr`，不会污染标准输出里的 JSON 结果。
-
-文件输入时会先统计总记录数，因此可以看到：
-
-```text
-[input] total records: 120000
-[input] progress: analyzed 50000/120000 records
-[input] progress: analyzed 100000/120000 records
-[input] done: analyzed 120000/120000 records
-```
-
-如果是 `stdin` 流式输入，无法提前知道总量，会退化成：
-
-```text
-[input] total records: unknown (streaming input)
-[input] progress: analyzed 50000 records
-```
-
-
-## Mock Input And Output
-
-### Sample Input
-
-```json
-{"timestamp":"2026-04-20T10:00:00Z","query":"SELECT * FROM cpu"}
-{"timestamp":"2026-04-20T10:01:00Z","query":"SELECT * FROM cpu"}
-{"timestamp":"2026-04-20T10:02:00Z","query":"SHOW TAG VALUES FROM cpu WITH KEY =~ /host.*/ WHERE region =~ /cn/ LIMIT 1000"}
-{"timestamp":"2026-04-20T10:03:00Z","query":"SELECT"}
-```
-
-### Example Command
-
-```bash
-cat <<'EOF' | env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze -detail-limit 2
-{"timestamp":"2026-04-20T10:00:00Z","query":"SELECT * FROM cpu"}
-{"timestamp":"2026-04-20T10:01:00Z","query":"SELECT * FROM cpu"}
-{"timestamp":"2026-04-20T10:02:00Z","query":"SHOW TAG VALUES FROM cpu WITH KEY =~ /host.*/ WHERE region =~ /cn/ LIMIT 1000"}
-{"timestamp":"2026-04-20T10:03:00Z","query":"SELECT"}
-EOF
-```
-
-### Example Output
-
-输出会是格式化后的 JSON，大意如下：
-
-- `total_records = 4`
-- `total_statements = 3`
-- `parse_error_count = 1`
-- `SELECT * FROM cpu` 被聚成一个 fingerprint，`count = 2`
-- `SHOW TAG VALUES ... LIMIT 1000` 被归一化成：
-
-```sql
-SHOW TAG VALUES FROM cpu WITH KEY =~ /.*/ WHERE region =~ /.*/ LIMIT 1
-```
-
-- 命中的规则包括：
-  - `has_wildcard`
-  - `no_time_filter`
-  - `has_regex`
-  - `large_limit`
-  - `meta_query`
-
-
-## Output Structure
-
-CLI 默认输出一个 JSON `Report`：
+示例：
 
 ```json
 {
-  "window_start": "optional",
-  "window_end": "optional",
+  "detail_limit": 5,
+  "workers": 4,
+  "query_cache_size": 10000,
+  "rules": {
+    "large_limit_threshold": 500,
+    "group_by_tag_threshold": 3,
+    "enabled": {
+      "no_time_filter": true,
+      "has_regex": true,
+      "has_wildcard": true,
+      "large_limit": true,
+      "group_by_high_cardinality_risk": true,
+      "meta_query": true,
+      "write_or_destructive": true,
+      "not_realtime_query": true
+    }
+  },
+  "realtime_query": {
+    "threshold_seconds": 86400
+  }
+}
+```
+
+默认值：
+
+- `detail_limit = 3`
+- `query_cache_size = 10000`
+- `large_limit_threshold = 1000`
+- `group_by_tag_threshold = 2`
+- `realtime_query.threshold_seconds = 86400`
+
+当 `rules.enabled` 省略时，所有规则默认启用。当 `rules.enabled` 存在但缺少某个规则 key 时，该规则也默认启用。
+
+## 实时查询判定
+
+实时查询分析适用于 select-like 语句：
+
+- `SELECT`
+- `EXPLAIN SELECT`
+- `CREATE CONTINUOUS QUERY` 的 source select
+
+Analyzer 会提取 `WHERE time` 比较条件，并把得到的时间范围和记录日志时间比较。
+
+查询被判定为 `realtime` 需要存在可提取的时间下界，且下界不晚于日志时间，并满足以下任一条件：
+
+- 下界和日志时间在同一个本地日期；
+- 下界距离日志时间不超过 `realtime_query.threshold_seconds`。
+
+查询被判定为 `non_realtime` 的情况：
+
+- 存在可提取的时间条件，但没有时间下界；
+- 时间下界晚于日志时间；
+- 时间下界早于配置阈值，且不在日志时间同一天。
+
+查询被判定为 `unknown` 的情况：
+
+- 日志时间为空；
+- 没有 `WHERE time` 条件；
+- 没有可提取的时间条件；
+- 时间条件位于 `OR` 下；
+- 时间值无法解析或无法规约。
+
+支持的 `WHERE time` 值形式：
+
+- RFC3339/RFC3339Nano 字符串，例如 `'2026-06-08T11:00:00Z'`
+- InfluxQL datetime 字符串，例如 `'2026-06-08 11:00:00'`
+- date-only 字符串，例如 `'2026-06-08'`
+- 相对 `now()` 表达式，例如 `now() - 30m`
+- 数字时间戳，会按数量级推断为秒、毫秒、微秒或纳秒
+
+数字时间戳推断只存在于 analyzer 的实时查询分析中，不改变核心 InfluxQL parser 的语义。
+
+非实时查询还会命中特殊规则 `not_realtime_query`。
+
+## 输出结构
+
+普通模式输出 JSON `Report`：
+
+```json
+{
+  "window_start": "optional RFC3339",
+  "window_end": "optional RFC3339",
+  "observed_start": "optional RFC3339",
+  "observed_end": "optional RFC3339",
   "total_records": 0,
   "records_in_window": 0,
   "total_statements": 0,
@@ -228,33 +228,34 @@ CLI 默认输出一个 JSON `Report`：
 
 关键字段：
 
-- `fingerprints`: 按归一化后 SQL 聚合
-  - `fingerprint`: `normalized_query` 的 SHA-256
-  - `statement_type`: 语句类型
-  - `normalized_query`: 归一化后的 InfluxQL
-  - `count`: 出现次数
-  - `sample_queries`: 原始样例
-  - `rules`: 该 fingerprint 命中的规则
-- `special_rules`: 按规则聚合
-  - `rule`: 规则名
-  - `count`: 命中次数
-  - `fingerprints`: 命中的 fingerprint 列表
-- `realtime_query`: 实时查询汇总
-  - `threshold_seconds`: 判定阈值，默认 `86400`
-  - `total`: 参与实时性分析的 select-like 语句数
-  - `realtime`: 判定为实时查询的数量
-  - `non_realtime`: 明确判定为非实时查询的数量
-  - `unknown`: 缺少日志时间、没有可提取 `WHERE time` 下界，或遇到不支持表达式时的数量
-  - `all_realtime`: `total > 0` 且没有 `non_realtime` 或 `unknown` 时为 `true`
-  - `sample_non_realtime`/`sample_unknown`: 样例查询、原因、日志时间和提取到的时间范围
-- `parse_errors`: 解析失败桶
-  - `error`: parser 错误信息
-  - `count`: 出现次数
-  - `sample_queries`: 失败样例
+- `fingerprints`: 按归一化 SQL fingerprint 聚合。
+  - `fingerprint`: `normalized_query` 的 SHA-256。
+  - `statement_type`: 语句类型。
+  - `normalized_query`: 归一化后的 InfluxQL。
+  - `count`: 出现次数。
+  - `sample_queries`: 原始样例，数量受 `detail_limit` 限制。
+  - `rules`: 该 fingerprint 命中的规则。
+- `special_rules`: 按规则聚合。
+  - `rule`: 规则名。
+  - `count`: 命中次数。
+  - `fingerprints`: 命中的 fingerprint 列表。
+- `realtime_query`: 实时查询汇总。
+  - `threshold_seconds`: 当前判定阈值。
+  - `total`: 参与实时性分析的 select-like 语句数。
+  - `realtime`: 实时查询数量。
+  - `non_realtime`: 明确非实时查询数量。
+  - `unknown`: 缺少或不支持实时性判定的数量。
+  - `all_realtime`: 仅当 `total > 0`、`non_realtime == 0` 且 `unknown == 0` 时为 `true`。
+  - `sample_non_realtime` / `sample_unknown`: 样例查询、原因、日志时间和提取到的时间范围。
+  - `non_realtime_log_time_distribution`: 非实时查询的日志时间分布，按 UTC 小时分桶；每个桶包含 `bucket_start`、`bucket_end` 和 `count`。
+- `parse_errors`: parser 错误桶。
+  - `error`: parser 错误文本。
+  - `count`: 出现次数。
+  - `sample_queries`: 原始样例，数量受 `detail_limit` 限制。
 
-### Compare Output Structure
+## 对比输出结构
 
-当同时提供 `-input-a` 和 `-input-b` 时，CLI 输出 `CompareReport`：
+对比模式输出 JSON `CompareReport`：
 
 ```json
 {
@@ -271,48 +272,24 @@ CLI 默认输出一个 JSON `Report`：
 
 关键字段：
 
-- `batch_a` / `batch_b`: 两批输入各自的总量、QPS 和有效时间跨度
-- `statement_delta`: B 相对 A 的总 statement 数变化
-- `qps_delta`: B 相对 A 的整体 QPS 变化
-- `new_fingerprints`: B 新出现的查询模板
-- `removed_fingerprints`: A 有但 B 消失的查询模板
-- `changed_fingerprints`: 两边都存在但次数或 QPS 发生变化的查询模板
-- `rule_deltas`: 特殊规则命中数和 QPS 的变化
+- `batch_a` / `batch_b`: 两批输入各自的总量、解析错误数、观测/窗口时间范围、有效时长和 QPS。
+- `statement_delta`: B 相对 A 的 statement 总数变化。
+- `qps_delta`: B 相对 A 的整体 QPS 变化。
+- `new_fingerprints`: 只在 B 中出现的 fingerprint。
+- `removed_fingerprints`: 只在 A 中出现的 fingerprint。
+- `changed_fingerprints`: A 和 B 都存在但次数发生变化的 fingerprint。
+- `rule_deltas`: 特殊规则命中数和 QPS 的变化。
 
-QPS 计算规则：
+QPS 有效时长计算顺序：
 
-- 优先使用显式 `window-start` / `window-end`
-- 否则使用输入中观测到的 `timestamp` 最小值和最大值
-- 如果时间跨度不可用但有数据，退化为 1 秒窗口，避免除零
+1. 如果显式提供了有序的 `window-start` / `window-end`，使用窗口时长；
+2. 否则使用观测到的 timestamp 最小值和最大值，前提是时长为正；
+3. 否则当有数据时退化为 `1` 秒；
+4. 否则为 `0`。
 
+## 特殊规则
 
-## Rule Config
-
-配置文件格式是 JSON，对应 `analyzer.AnalyzerConfig`。
-
-示例：
-
-```json
-{
-  "detail_limit": 5,
-  "query_cache_size": 10000,
-  "rules": {
-    "large_limit_threshold": 500,
-    "group_by_tag_threshold": 3,
-    "enabled": {
-      "no_time_filter": true,
-      "has_regex": true,
-      "has_wildcard": true,
-      "large_limit": true,
-      "group_by_high_cardinality_risk": true,
-      "meta_query": true,
-      "write_or_destructive": true
-    }
-  }
-}
-```
-
-当前支持的规则：
+当前规则：
 
 - `no_time_filter`
 - `has_regex`
@@ -321,141 +298,56 @@ QPS 计算规则：
 - `group_by_high_cardinality_risk`
 - `meta_query`
 - `write_or_destructive`
+- `not_realtime_query`
 
-默认阈值：
+## 内部结构
 
-- `large_limit_threshold = 1000`
-- `group_by_tag_threshold = 2`
-- `query_cache_size = 10000`
+主要入口：
 
+- `cmd/influxql-analyze/main.go`: CLI 参数、配置加载、JSONL 读取、时间解析、进度输出和报告编码。
+- `analyzer/analyzer.go`: public analyzer 类型、聚合状态、记录摄入、查询缓存、报告构造和对比报告。
+- `analyzer/normalize.go`: AST 特征提取和 fingerprint 归一化。
+- `analyzer/rules.go`: 静态特殊规则匹配。
+- `analyzer/realtime.go`: 实时查询提取、判定、样例汇总和 worker 合并 helper。
 
-## Internal Structure
+## 当前行为和限制
 
-### Entry
+稳定行为：
 
-- [cmd/influxql-analyze/main.go](/Users/duzhiwang/workspace/goWorkspace/influxql/cmd/influxql-analyze/main.go)
+- 多 statement 查询会由 parser 拆分，并按 statement 分别统计。
+- 解析失败不会中断整批分析，会聚合到 `parse_errors`。
+- 结构相同但字面量不同的查询会归到同一个 fingerprint。
+- CLI 进度输出写入 stderr，不污染 stdout 中的 JSON。
+- Analyzer 查询缓存以原始 query 为 key，同时保存归一化结果和实时查询检查信息。
+- `Workers > 1` 时使用 worker-local analyzer，最后合并状态。
 
-职责：
+当前限制：
 
-- 解析 CLI 参数
-- 读取 JSONL
-- 解析时间窗口和配置
-- 调用 `analyzer.New(...).AddRecord(...)`
-- 输出最终 `Report`
+- 输出格式仅支持 JSON。
+- 规则配置是阈值和启用/禁用形式，不是完整规则 DSL。
+- 实时查询提取支持 `AND` 组合的时间比较，不支持 `OR` 下的时间条件。
+- 归一化会保留 measurement 名、field 名、tag key 和函数名。
 
-### Core Package
+## Benchmark
 
-- [analyzer/analyzer.go](/Users/duzhiwang/workspace/goWorkspace/influxql/analyzer/analyzer.go)
-
-职责：
-
-- 定义核心数据结构：`Record`、`NormalizeResult`、`FeatureSet`、`RuleSummary`、`Report`
-- 管理聚合状态
-- 对外暴露：
-  - `DefaultAnalyzerConfig`
-  - `New`
-  - `Analyze`
-  - `NormalizeQuery`
-  - `AddRecord`
-  - `Report`
-
-### Normalization And Feature Extraction
-
-- [analyzer/normalize.go](/Users/duzhiwang/workspace/goWorkspace/influxql/analyzer/normalize.go)
-
-职责：
-
-- 调用仓库现有 parser：`influxql.ParseQuery`
-- 基于 AST 做模板化归一化
-- 提取规则匹配依赖的结构特征
-
-当前归一化策略：
-
-- 保留语句结构
-- 保留 measurement、tag key、field key、函数名
-- 把字符串、时间、数值、duration、regex、list、参数等替换为模板值
-- 把 `LIMIT` / `OFFSET` / `SLIMIT` / `SOFFSET` 归一化到固定值
-
-### Rule Matching
-
-- [analyzer/rules.go](/Users/duzhiwang/workspace/goWorkspace/influxql/analyzer/rules.go)
-
-职责：
-
-- 根据 `FeatureSet` 和配置做规则判定
-- 支持启用/禁用规则
-- 支持阈值配置
-
-
-## Current Behavior
-
-### What Is Stable
-
-- 多条 statement 会按 parser 结果拆分并分别统计
-- 解析失败的语句不会中断整批分析，会进入 `parse_errors`
-- 同结构不同字面量的查询会归到同一个 fingerprint
-- 输出 JSON 字段结构稳定，适合后续做离线分析或接入其他系统
-
-### Current Limits
-
-- 当前只支持 `JSON` 输出
-- 规则扩展目前是“参数化 + 开关”，不是完整 DSL
-- 执行时间只用于窗口过滤，不会用于把 `now()` 折算成具体时间
-- 归一化是模板化，不会主动抹平 measurement 或字段名差异
-
-### Concurrency
-
-当前版本已经支持并发分析：
-
-- CLI 通过 `-workers` 控制并发 worker 数
-- 读取输入仍按流式逐行进行
-- 分析阶段按批次并发执行，再合并到最终聚合结果
-
-适合的场景：
-
-- 大量独立查询日志的批量归类
-- parser 和归一化是主要 CPU 开销时
-
-
-## Test Status
-
-### Automated Tests
-
-测试文件：
-
-- [analyzer/analyzer_test.go](/Users/duzhiwang/workspace/goWorkspace/influxql/analyzer/analyzer_test.go)
-
-当前覆盖：
-
-- 不同字面量查询归到同一个 fingerprint
-- 同一类查询的规则聚合和计数
-- parser 失败语句进入错误桶
-
-### Verified Command
-
-已在当前环境使用固定 Go 二进制跑通：
+运行吞吐量 benchmark：
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go test ./analyzer
+env GOCACHE=/tmp/influxql-gocache go test ./analyzer ./cmd/influxql-analyze -run=BenchmarkNeverMatches -bench=Throughput -benchmem
 ```
 
-结果：
+benchmark 覆盖 analyzer 批量分析吞吐和 CLI executor 日志解码吞吐。输出中的 `records/s` 是每秒处理记录数。
 
-```text
-ok  	github.com/influxdata/influxql/analyzer	1.135s
-```
+## 验证命令
 
-### Environment Note
-
-当前机器同时存在多个 Go toolchain 路径。直接使用 `go` 可能会命中不一致的 `go1.25.7` / `go1.25.8` 组合，导致编译报错。当前可工作的方式是显式使用：
+运行全量测试：
 
 ```bash
-/Users/duzhiwang/devkits/go125/go/bin/go
+env GOCACHE=/tmp/influxql-gocache go test ./...
 ```
 
+运行 vet：
 
-## Suggested Next Steps
-
-- 给 CLI 增加 `detail` 模式，输出逐条命中的明细记录
-- 给规则系统补充更细粒度的阈值和白名单能力
-- 如果后续需要做服务化，再在 `analyzer` 包之上包一层 HTTP API
+```bash
+env GOCACHE=/tmp/influxql-gocache go vet ./...
+```

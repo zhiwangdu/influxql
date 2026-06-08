@@ -3,6 +3,7 @@ package analyzer
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,6 +67,7 @@ func (a *Analyzer) evaluateRealtime(check realtimeCheck, logTime time.Time, quer
 		a.report.RealtimeQuery.Realtime++
 	case realtimeStatusNonRealtime:
 		a.report.RealtimeQuery.NonRealtime++
+		a.addNonRealtimeLogTimeBucket(logTime)
 		a.appendRealtimeSample(&a.report.RealtimeQuery.SampleNonRealtime, query, eval, logTime)
 	case realtimeStatusUnknown:
 		a.report.RealtimeQuery.Unknown++
@@ -320,4 +322,46 @@ func appendRealtimeQuerySample(samples *[]RealtimeQuerySample, sample RealtimeQu
 		return
 	}
 	*samples = append(*samples, sample)
+}
+
+func (a *Analyzer) addNonRealtimeLogTimeBucket(logTime time.Time) {
+	if logTime.IsZero() {
+		return
+	}
+	bucketStart := logTime.UTC().Truncate(time.Hour)
+	bucket := a.nonRealtimeLogTimeBuckets[bucketStart]
+	if bucket == nil {
+		bucket = &RealtimeLogTimeBucketSummary{
+			BucketStart: bucketStart,
+			BucketEnd:   bucketStart.Add(time.Hour),
+		}
+		a.nonRealtimeLogTimeBuckets[bucketStart] = bucket
+	}
+	bucket.Count++
+}
+
+func sortedRealtimeLogTimeBuckets(src map[time.Time]*RealtimeLogTimeBucketSummary) []RealtimeLogTimeBucketSummary {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]RealtimeLogTimeBucketSummary, 0, len(src))
+	for _, bucket := range src {
+		out = append(out, *bucket)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].BucketStart.Before(out[j].BucketStart)
+	})
+	return out
+}
+
+func (a *Analyzer) mergeNonRealtimeLogTimeBuckets(other *Analyzer) {
+	for start, otherBucket := range other.nonRealtimeLogTimeBuckets {
+		bucket := a.nonRealtimeLogTimeBuckets[start]
+		if bucket == nil {
+			copyBucket := *otherBucket
+			a.nonRealtimeLogTimeBuckets[start] = &copyBucket
+			continue
+		}
+		bucket.Count += otherBucket.Count
+	}
 }

@@ -118,15 +118,22 @@ type RealtimeQuerySample struct {
 	TimeRange *RealtimeTimeRangeSummary `json:"time_range,omitempty"`
 }
 
+type RealtimeLogTimeBucketSummary struct {
+	BucketStart time.Time `json:"bucket_start"`
+	BucketEnd   time.Time `json:"bucket_end"`
+	Count       int       `json:"count"`
+}
+
 type RealtimeQuerySummary struct {
-	ThresholdSeconds  int64                 `json:"threshold_seconds"`
-	Total             int                   `json:"total"`
-	Realtime          int                   `json:"realtime"`
-	NonRealtime       int                   `json:"non_realtime"`
-	Unknown           int                   `json:"unknown"`
-	AllRealtime       bool                  `json:"all_realtime"`
-	SampleNonRealtime []RealtimeQuerySample `json:"sample_non_realtime,omitempty"`
-	SampleUnknown     []RealtimeQuerySample `json:"sample_unknown,omitempty"`
+	ThresholdSeconds               int64                          `json:"threshold_seconds"`
+	Total                          int                            `json:"total"`
+	Realtime                       int                            `json:"realtime"`
+	NonRealtime                    int                            `json:"non_realtime"`
+	Unknown                        int                            `json:"unknown"`
+	AllRealtime                    bool                           `json:"all_realtime"`
+	SampleNonRealtime              []RealtimeQuerySample          `json:"sample_non_realtime,omitempty"`
+	SampleUnknown                  []RealtimeQuerySample          `json:"sample_unknown,omitempty"`
+	NonRealtimeLogTimeDistribution []RealtimeLogTimeBucketSummary `json:"non_realtime_log_time_distribution,omitempty"`
 }
 
 type Report struct {
@@ -153,6 +160,8 @@ type Analyzer struct {
 	fingerprints map[string]*FingerprintSummary
 	rules        map[string]*RuleSummary
 	parseErrors  map[string]*ParseErrorSummary
+
+	nonRealtimeLogTimeBuckets map[time.Time]*RealtimeLogTimeBucketSummary
 
 	queryCache     map[string]queryAnalysis
 	queryCacheKeys []string
@@ -235,9 +244,10 @@ func New(cfg AnalyzerConfig, windowStart, windowEnd *time.Time) *Analyzer {
 				ThresholdSeconds: cfg.RealtimeQuery.ThresholdSeconds,
 			},
 		},
-		fingerprints: make(map[string]*FingerprintSummary),
-		rules:        make(map[string]*RuleSummary),
-		parseErrors:  make(map[string]*ParseErrorSummary),
+		fingerprints:              make(map[string]*FingerprintSummary),
+		rules:                     make(map[string]*RuleSummary),
+		parseErrors:               make(map[string]*ParseErrorSummary),
+		nonRealtimeLogTimeBuckets: make(map[time.Time]*RealtimeLogTimeBucketSummary),
 	}
 	if cfg.QueryCacheSize > 0 {
 		a.queryCache = make(map[string]queryAnalysis, cfg.QueryCacheSize)
@@ -514,6 +524,7 @@ func (a *Analyzer) Report() Report {
 	report.SpecialRules = sortedRules(a.rules)
 	report.ParseErrors = sortedParseErrors(a.parseErrors)
 	report.RealtimeQuery.AllRealtime = report.RealtimeQuery.Total > 0 && report.RealtimeQuery.NonRealtime == 0 && report.RealtimeQuery.Unknown == 0
+	report.RealtimeQuery.NonRealtimeLogTimeDistribution = sortedRealtimeLogTimeBuckets(a.nonRealtimeLogTimeBuckets)
 	return report
 }
 
@@ -524,6 +535,7 @@ func (a *Analyzer) merge(other *Analyzer) {
 	a.report.TotalStatements += other.report.TotalStatements
 	a.report.ParseErrorCount += other.report.ParseErrorCount
 	a.mergeRealtimeQuery(other.report.RealtimeQuery)
+	a.mergeNonRealtimeLogTimeBuckets(other)
 
 	for fp, otherBucket := range other.fingerprints {
 		bucket := a.fingerprints[fp]

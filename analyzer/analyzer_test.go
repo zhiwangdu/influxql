@@ -288,3 +288,37 @@ func TestAnalyzeRealtimeQuerySummaryParallelMerge(t *testing.T) {
 		t.Fatalf("non realtime count = %d, want %d", got, want)
 	}
 }
+
+func TestAnalyzeRealtimeNonRealtimeLogTimeDistribution(t *testing.T) {
+	cfg := DefaultAnalyzerConfig()
+	cfg.Workers = 2
+	base := time.Date(2026, 6, 8, 12, 15, 0, 0, time.UTC)
+	records := []Record{
+		{Timestamp: base, Query: `SELECT * FROM cpu WHERE time >= '2026-06-01T00:00:00Z'`},
+		{Timestamp: base.Add(20 * time.Minute), Query: `SELECT * FROM cpu WHERE time >= '2026-06-01T00:00:00Z'`},
+		{Timestamp: base.Add(time.Hour), Query: `SELECT * FROM cpu WHERE time >= '2026-06-01T00:00:00Z'`},
+		{Timestamp: base.Add(time.Hour), Query: `SELECT * FROM cpu WHERE time >= now() - 5m`},
+	}
+
+	report, err := Analyze(records, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	buckets := report.RealtimeQuery.NonRealtimeLogTimeDistribution
+	if got, want := len(buckets), 2; got != want {
+		t.Fatalf("bucket count = %d, want %d: %#v", got, want, buckets)
+	}
+	if got, want := buckets[0].BucketStart, time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("first bucket start = %s, want %s", got, want)
+	}
+	if got, want := buckets[0].Count, 2; got != want {
+		t.Fatalf("first bucket count = %d, want %d", got, want)
+	}
+	if got, want := buckets[1].BucketStart, time.Date(2026, 6, 8, 13, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("second bucket start = %s, want %s", got, want)
+	}
+	if got, want := buckets[1].Count, 1; got != want {
+		t.Fatalf("second bucket count = %d, want %d", got, want)
+	}
+}
