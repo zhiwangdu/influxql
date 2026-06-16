@@ -19,6 +19,7 @@ This file is the primary behavior specification for the current `influxql-analyz
 - CLI package: `cmd/influxql-analyze`
 
 The CLI is a thin input/output wrapper around the library. Core behavior should generally live in `analyzer/`.
+The current module and CI baseline use Go 1.26.
 
 ## Input
 

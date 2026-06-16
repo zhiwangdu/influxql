@@ -20,6 +20,8 @@ fingerprinting, and special-query detection.
 
 ### Quick Start
 
+The analyzer is built and tested with Go 1.26.
+
 Input format is `JSONL`, one record per line:
 
 ```json
@@ -30,13 +32,13 @@ Input format is `JSONL`, one record per line:
 Run the analyzer from stdin:
 
 ```bash
-cat input.jsonl | env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze
+cat input.jsonl | env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze
 ```
 
 Or run it against a file:
 
 ```bash
-env GOCACHE=/tmp/influxql-gocache /Users/duzhiwang/devkits/go125/go/bin/go run ./cmd/influxql-analyze \
+env GOCACHE=/tmp/influxql-gocache go run ./cmd/influxql-analyze \
   -input ./input.jsonl \
   -detail-limit 2 \
   -progress-every 5000 \
